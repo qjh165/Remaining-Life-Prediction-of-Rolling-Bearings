@@ -95,7 +95,6 @@ def setup_matplotlib_fonts():
     return selected_font
 
 
-# utils.py 中的 setup_device 函数
 def setup_device(force_cpu=False):
     """设置全局设备（GPU/CPU）"""
     if force_cpu:
@@ -127,51 +126,11 @@ def setup_device(force_cpu=False):
     return device
 
 
-def setup_logging(log_dir: str = "logs") -> logging.Logger:
-    """配置日志系统"""
-    os.makedirs(log_dir, exist_ok=True)
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(log_dir, f"batch_processing_{timestamp}.log")
-    
-    logger = logging.getLogger("BatchProcessor")
-    logger.setLevel(logging.INFO)
-    
-    # 清除现有处理器
-    if logger.hasHandlers():
-        logger.handlers.clear()
-    
-    # 文件处理器
-    file_handler = logging.FileHandler(log_file, encoding='utf-8')
-    file_handler.setLevel(logging.INFO)
-    file_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(file_format)
-    
-    # 控制台处理器
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', 
-                                      datefmt='%H:%M:%S')
-    console_handler.setFormatter(console_format)
-    
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-    
-    # 获取全局设备
-    from .config import DEVICE
-    logger.info(f"使用设备: {DEVICE}")
-    if DEVICE.type == 'cuda':
-        logger.info(f"GPU内存信息: 总量={torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f}GB, "
-                   f"已分配={torch.cuda.memory_allocated(0) / 1024**3:.2f}GB, "
-                   f"缓存={torch.cuda.memory_reserved(0) / 1024**3:.2f}GB")
-    
-    return logger
-
-
+# 删除重复的show_device_info函数，只保留一个
 def show_device_info():
     """显示设备信息"""
-    from .config import DEVICE
-    
+    # 注意：这里需要从全局变量获取DEVICE，但为了避免循环导入
+    # 可以在调用时传入device参数，或者使用全局变量
     print("\n" + "="*50)
     print("设备信息")
     print("="*50)
@@ -183,7 +142,9 @@ def show_device_info():
         for i in range(torch.cuda.device_count()):
             print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
             print(f"     内存: {torch.cuda.get_device_properties(i).total_memory / 1024**3:.2f} GB")
-        print(f"当前设备: {DEVICE}")
+        # 注意：这里使用torch.cuda.current_device()而不是全局DEVICE
+        current_device = torch.cuda.current_device()
+        print(f"当前设备: cuda:{current_device}")
     else:
         print("CPU设备: 使用CPU进行训练和推理")
     print("="*50)
@@ -194,7 +155,6 @@ selected_font = setup_matplotlib_fonts()
 
 # 全局设备变量
 DEVICE = setup_device()
-
 
 
 def setup_logging(log_dir: str = "logs") -> logging.Logger:
@@ -236,21 +196,43 @@ def setup_logging(log_dir: str = "logs") -> logging.Logger:
     
     return logger
 
+def get_memory_usage():
+    """【新增】获取当前内存使用情况"""
+    import psutil
+    import torch
+    
+    memory_info = {}
+    
+    # CPU内存
+    cpu_memory = psutil.virtual_memory()
+    memory_info['cpu_total_gb'] = cpu_memory.total / 1024**3
+    memory_info['cpu_available_gb'] = cpu_memory.available / 1024**3
+    memory_info['cpu_used_gb'] = cpu_memory.used / 1024**3
+    memory_info['cpu_percent'] = cpu_memory.percent
+    
+    # GPU内存（如果可用）
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            memory_info[f'gpu_{i}_total_gb'] = torch.cuda.get_device_properties(i).total_memory / 1024**3
+            memory_info[f'gpu_{i}_allocated_gb'] = torch.cuda.memory_allocated(i) / 1024**3
+            memory_info[f'gpu_{i}_reserved_gb'] = torch.cuda.memory_reserved(i) / 1024**3
+            memory_info[f'gpu_{i}_free_gb'] = memory_info[f'gpu_{i}_total_gb'] - memory_info[f'gpu_{i}_allocated_gb']
+            memory_info[f'gpu_{i}_percent'] = (memory_info[f'gpu_{i}_allocated_gb'] / memory_info[f'gpu_{i}_total_gb']) * 100
+    
+    return memory_info
 
-def show_device_info():
-    """显示设备信息"""
+
+def print_memory_usage():
+    """【新增】打印内存使用情况"""
+    mem_info = get_memory_usage()
+    
     print("\n" + "="*50)
-    print("设备信息")
+    print("内存使用情况")
     print("="*50)
-    print(f"PyTorch版本: {torch.__version__}")
-    print(f"CUDA可用: {torch.cuda.is_available()}")
+    print(f"CPU内存: 已用={mem_info['cpu_used_gb']:.2f}GB / 总计={mem_info['cpu_total_gb']:.2f}GB ({mem_info['cpu_percent']:.1f}%)")
     
     if torch.cuda.is_available():
-        print(f"GPU数量: {torch.cuda.device_count()}")
         for i in range(torch.cuda.device_count()):
-            print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
-            print(f"     内存: {torch.cuda.get_device_properties(i).total_memory / 1024**3:.2f} GB")
-        print(f"当前设备: {DEVICE}")
-    else:
-        print("CPU设备: 使用CPU进行训练和推理")
+            print(f"GPU {i} 内存: 已分配={mem_info[f'gpu_{i}_allocated_gb']:.2f}GB / "
+                  f"总计={mem_info[f'gpu_{i}_total_gb']:.2f}GB ({mem_info[f'gpu_{i}_percent']:.1f}%)")
     print("="*50)

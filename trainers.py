@@ -26,7 +26,7 @@ except ImportError:
 
 from utils import DEVICE as global_device
 from models import RULPredictor, MultiModalRULPredictor
-from evaluation import calculate_comprehensive_metrics, calculate_phm_score
+from evaluation import calculate_comprehensive_metrics
 
 
 class NegativeR2Loss(nn.Module):
@@ -51,17 +51,8 @@ class WeightedMSELoss(nn.Module):
         super(WeightedMSELoss, self).__init__()
     
     def forward(self, pred, target, weights=None):
-        """
-        计算加权MSE损失
-        
-        参数:
-            pred: 预测值
-            target: 目标值
-            weights: 样本权重，形状与target相同
-        """
         squared_error = (pred - target) ** 2
         if weights is not None:
-            # 确保weights与squared_error形状一致
             if weights.dim() < squared_error.dim():
                 weights = weights.view(-1, 1)
             return torch.mean(weights * squared_error)
@@ -78,22 +69,31 @@ class BaseTrainer:
         self.device = device if device is not None else global_device
         self.model = model.move_to_device(self.device)
         self.optimizer = optimizer
-        self.criterion = criterion  # 用于RUL的损失函数
+        self.criterion = criterion
         self.scheduler = scheduler
         self.experiment_tracker = experiment_tracker
         self.config = config or {}
         
         # 损失权重配置
         self.rul_loss_weight = self.config.get('rul_loss_weight', 1.0)
-        self.hi_loss_weight = self.config.get('hi_loss_weight', 1.0)  # 增大HI权重
+        self.hi_loss_weight = self.config.get('hi_loss_weight', 1.0)
         
         # 创建损失函数
         self.mse_loss = nn.MSELoss()
         self.weighted_mse_loss = WeightedMSELoss()
         
-        # 是否使用样本加权（退化后期权重更大）
+        # 是否使用样本加权
         self.use_sample_weighting = self.config.get('use_sample_weighting', True)
-        self.weighting_alpha = self.config.get('weighting_alpha', 2.0)  # 权重指数
+        self.weighting_alpha = self.config.get('weighting_alpha', 2.0)
+        
+        # 【修改4】验证集平滑配置
+        self.validation_smoothing = self.config.get('validation_smoothing', True)
+        self.validation_smoothing_alpha = self.config.get('validation_smoothing_alpha', 0.9)
+        self.validation_frequency = self.config.get('validation_frequency', 2)
+        
+        # 初始化平滑值
+        self.smoothed_val_r2 = None
+        self.smoothed_val_loss = None
         
         self.history = {
             'train_total_loss': [],
@@ -104,10 +104,8 @@ class BaseTrainer:
             'val_hi_loss': [],
             'train_r2': [],
             'val_r2': [],
-            'train_hi_r2': [],
-            'val_hi_r2': [],
-            'train_phm_score': [],
-            'val_phm_score': [],
+            'val_r2_raw': [],      # 【新增】原始验证R²
+            'val_r2_smoothed': [], # 【新增】平滑后的验证R²
             'learning_rates': []
         }
         
@@ -115,6 +113,7 @@ class BaseTrainer:
         print(f"训练器初始化: 使用设备 {self.device}, 模型类型: {self.model_type}")
         print(f"损失权重: RUL={self.rul_loss_weight}, HI={self.hi_loss_weight}")
         print(f"使用样本加权: {self.use_sample_weighting}, 权重指数: {self.weighting_alpha}")
+        print(f"验证平滑: {self.validation_smoothing}, 频率: 每{self.validation_frequency}轮")
         
         self._init_experiment_tracking()
     
@@ -152,6 +151,21 @@ class BaseTrainer:
         weights = weights / (torch.sum(weights) + 1e-8)
         return weights
     
+    def _apply_smoothing(self, new_value, smoothed_value):
+        """
+        应用指数移动平均平滑
+        
+        参数:
+            new_value: 新的观测值
+            smoothed_value: 当前的平滑值
+        
+        返回:
+            更新后的平滑值
+        """
+        if smoothed_value is None:
+            return new_value
+        return self.validation_smoothing_alpha * smoothed_value + (1 - self.validation_smoothing_alpha) * new_value
+    
     def train_epoch(self, train_loader):
         raise NotImplementedError
     
@@ -160,13 +174,18 @@ class BaseTrainer:
     
     def train(self, train_loader, val_loader, num_epochs=100, 
               patience=15, checkpoint_path='best_model.pth'):
-        
-        best_val_hi_r2 = -float('inf')  # 使用HI-R²作为早停指标
+        """
+        训练模型，使用平滑后的 RUL-R² 作为早停指标
+        """
+        best_val_r2 = -float('inf')
         patience_counter = 0
+        min_delta = self.config.get('early_stopping_min_delta', 0.001)
         
         print(f"开始训练，共{num_epochs}个epoch")
         print(f"训练设备: {self.device}")
         print(f"模型参数量: {self.model.get_parameter_count():,}")
+        print(f"早停配置: patience={patience}, min_delta={min_delta}")
+        print(f"早停指标: 平滑RUL-R² (alpha={self.validation_smoothing_alpha})")
         print("-" * 80)
         
         for epoch in range(num_epochs):
@@ -177,97 +196,145 @@ class BaseTrainer:
                 self.history['learning_rates'].append(current_lr)
                 
                 train_loss, train_metrics = self.train_epoch(train_loader)
-                val_loss, val_metrics = self.validate(val_loader)
                 
-                if self.scheduler is not None:
+                # 【修改4】降低验证频率
+                should_validate = (epoch + 1) % self.validation_frequency == 0 or epoch == 0
+                
+                if should_validate:
+                    val_loss, val_metrics = self.validate(val_loader)
+                    raw_val_r2 = val_metrics.get('r2', 0)
+                    
+                    # 应用平滑
+                    if self.validation_smoothing:
+                        self.smoothed_val_r2 = self._apply_smoothing(raw_val_r2, self.smoothed_val_r2)
+                        self.smoothed_val_loss = self._apply_smoothing(val_loss, self.smoothed_val_loss)
+                        current_val_r2 = self.smoothed_val_r2
+                        current_val_loss = self.smoothed_val_loss
+                    else:
+                        current_val_r2 = raw_val_r2
+                        current_val_loss = val_loss
+                    
+                    # 保存历史
+                    self.history['val_total_loss'].append(val_loss)
+                    self.history['val_rul_loss'].append(val_metrics.get('rul_loss', 0))
+                    self.history['val_hi_loss'].append(val_metrics.get('hi_loss', 0))
+                    self.history['val_r2'].append(current_val_r2)
+                    self.history['val_r2_raw'].append(raw_val_r2)
+                    if self.validation_smoothing:
+                        self.history['val_r2_smoothed'].append(current_val_r2)
+                    
+                    # 打印验证结果
+                    print(f"Train Loss: {train_loss:.6f} (RUL: {train_metrics.get('rul_loss', 0):.6f}, HI: {train_metrics.get('hi_loss', 0):.6f})")
+                    print(f"         RUL-R²: {train_metrics.get('r2', 0):.4f}")
+                    if self.validation_smoothing:
+                        print(f"Val Loss:   {val_loss:.6f} (原始) / {current_val_loss:.6f} (平滑)")
+                        print(f"         RUL-R²: {raw_val_r2:.4f} (原始) / {current_val_r2:.4f} (平滑)")
+                    else:
+                        print(f"Val Loss:   {val_loss:.6f} (RUL: {val_metrics.get('rul_loss', 0):.6f}, HI: {val_metrics.get('hi_loss', 0):.6f})")
+                        print(f"         RUL-R²: {current_val_r2:.4f}")
+                    
+                    # 使用平滑后的 R² 作为早停指标
+                    current_val_score = current_val_r2
+                    improvement = current_val_score - best_val_r2
+                    
+                    if current_val_score > best_val_r2 + min_delta:
+                        if best_val_r2 == -float('inf'):
+                            print(f"✓ 验证RUL-R²: {current_val_score:.4f} (首次保存)")
+                        else:
+                            print(f"✓ 验证RUL-R²显著提升: {best_val_r2:.4f} -> {current_val_score:.4f} (+{improvement:.4f})")
+                        
+                        best_val_r2 = current_val_score
+                        patience_counter = 0
+                        
+                        torch.save({
+                            'epoch': epoch,
+                            'model_state_dict': self.model.state_dict(),
+                            'optimizer_state_dict': self.optimizer.state_dict(),
+                            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
+                            'val_loss': val_loss,
+                            'val_r2': raw_val_r2,
+                            'val_r2_smoothed': current_val_r2,
+                            'train_loss': train_loss,
+                            'train_r2': train_metrics.get('r2', 0),
+                            'model_type': type(self.model).__name__,
+                        }, checkpoint_path)
+                        print(f"✓ 保存最佳模型: {checkpoint_path}")
+                        
+                        if self.experiment_tracker == 'mlflow' and MLFLOW_AVAILABLE:
+                            mlflow.log_artifact(checkpoint_path)
+                        elif self.experiment_tracker == 'wandb' and WANDB_AVAILABLE:
+                            wandb.save(checkpoint_path)
+                            
+                    else:
+                        patience_counter += 1
+                        if improvement > 0:
+                            print(f"  验证RUL-R²略有提升但未超过阈值 (+{improvement:.4f} < {min_delta:.4f})")
+                        else:
+                            print(f"  验证RUL-R²未提升 (当前: {current_val_score:.4f}, 最佳: {best_val_r2:.4f}, 差距: {improvement:+.4f})")
+                        
+                        if patience_counter >= patience:
+                            print(f"早停触发，停止训练 (连续{patience}轮未显著提升)")
+                            break
+                else:
+                    # 不需要验证的epoch，只打印训练指标
+                    print(f"Train Loss: {train_loss:.6f} (RUL: {train_metrics.get('rul_loss', 0):.6f}, HI: {train_metrics.get('hi_loss', 0):.6f})")
+                    print(f"         RUL-R²: {train_metrics.get('r2', 0):.4f}")
+                    print(f"         (跳过验证，下次验证在 epoch {epoch + self.validation_frequency + 1})")
+                    
+                    # 保存训练历史（验证部分用None填充）
+                    self.history['val_total_loss'].append(None)
+                    self.history['val_rul_loss'].append(None)
+                    self.history['val_hi_loss'].append(None)
+                    self.history['val_r2'].append(None)
+                    self.history['val_r2_raw'].append(None)
+                    if self.validation_smoothing:
+                        self.history['val_r2_smoothed'].append(None)
+                
+                # 保存训练历史
+                self.history['train_total_loss'].append(train_loss)
+                self.history['train_rul_loss'].append(train_metrics.get('rul_loss', 0))
+                self.history['train_hi_loss'].append(train_metrics.get('hi_loss', 0))
+                self.history['train_r2'].append(train_metrics.get('r2', 0))
+                
+                # 记录日志指标
+                log_metrics = {
+                    'train_total_loss': train_loss,
+                    'train_rul_loss': train_metrics.get('rul_loss', 0),
+                    'train_hi_loss': train_metrics.get('hi_loss', 0),
+                    'train_r2': train_metrics.get('r2', 0),
+                    'learning_rate': current_lr
+                }
+                if should_validate:
+                    log_metrics.update({
+                        'val_total_loss': val_loss,
+                        'val_rul_loss': val_metrics.get('rul_loss', 0),
+                        'val_hi_loss': val_metrics.get('hi_loss', 0),
+                        'val_r2': raw_val_r2,
+                        'val_r2_smoothed': current_val_r2 if self.validation_smoothing else raw_val_r2
+                    })
+                
+                self._log_metrics(log_metrics, step=epoch)
+                
+                # 学习率调度
+                if self.scheduler is not None and should_validate:
                     if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                         self.scheduler.step(val_loss)
                     else:
                         self.scheduler.step()
-                
-                # 保存训练历史
-                self.history['train_total_loss'].append(train_loss)
-                self.history['val_total_loss'].append(val_loss)
-                self.history['train_rul_loss'].append(train_metrics.get('rul_loss', 0))
-                self.history['val_rul_loss'].append(val_metrics.get('rul_loss', 0))
-                self.history['train_hi_loss'].append(train_metrics.get('hi_loss', 0))
-                self.history['val_hi_loss'].append(val_metrics.get('hi_loss', 0))
-                self.history['train_r2'].append(train_metrics.get('r2', 0))
-                self.history['val_r2'].append(val_metrics.get('r2', 0))
-                self.history['train_hi_r2'].append(train_metrics.get('hi_r2', 0))
-                self.history['val_hi_r2'].append(val_metrics.get('hi_r2', 0))
-                self.history['train_phm_score'].append(train_metrics.get('phm_score', 0))
-                self.history['val_phm_score'].append(val_metrics.get('phm_score', 0))
-                
-                # 打印进度
-                print(f"Train Loss: {train_loss:.6f} (RUL: {train_metrics.get('rul_loss', 0):.6f}, HI: {train_metrics.get('hi_loss', 0):.6f})")
-                print(f"         R²: {train_metrics.get('r2', 0):.4f}, HI-R²: {train_metrics.get('hi_r2', 0):.4f}")
-                print(f"         PHM Score: {train_metrics.get('phm_score', 0):.4f}")
-                print(f"Val Loss:   {val_loss:.6f} (RUL: {val_metrics.get('rul_loss', 0):.6f}, HI: {val_metrics.get('hi_loss', 0):.6f})")
-                print(f"         R²: {val_metrics.get('r2', 0):.4f}, HI-R²: {val_metrics.get('hi_r2', 0):.4f}")
-                print(f"         PHM Score: {val_metrics.get('phm_score', 0):.4f}")
-                
-                log_metrics = {
-                    'train_total_loss': train_loss,
-                    'val_total_loss': val_loss,
-                    'train_rul_loss': train_metrics.get('rul_loss', 0),
-                    'val_rul_loss': val_metrics.get('rul_loss', 0),
-                    'train_hi_loss': train_metrics.get('hi_loss', 0),
-                    'val_hi_loss': val_metrics.get('hi_loss', 0),
-                    'train_r2': train_metrics.get('r2', 0),
-                    'val_r2': val_metrics.get('r2', 0),
-                    'train_hi_r2': train_metrics.get('hi_r2', 0),
-                    'val_hi_r2': val_metrics.get('hi_r2', 0),
-                    'train_phm_score': train_metrics.get('phm_score', 0),
-                    'val_phm_score': val_metrics.get('phm_score', 0),
-                    'learning_rate': current_lr
-                }
-                self._log_metrics(log_metrics, step=epoch)
-                
-                # 使用HI-R²作为早停指标
-                current_val_score = val_metrics.get('hi_r2', 0)
-                if current_val_score > best_val_hi_r2:
-                    best_val_hi_r2 = current_val_score
-                    patience_counter = 0
-                    
-                    torch.save({
-                        'epoch': epoch,
-                        'model_state_dict': self.model.state_dict(),
-                        'optimizer_state_dict': self.optimizer.state_dict(),
-                        'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
-                        'val_loss': val_loss,
-                        'val_r2': val_metrics.get('r2', 0),
-                        'val_hi_r2': val_metrics.get('hi_r2', 0),
-                        'train_loss': train_loss,
-                        'train_r2': train_metrics.get('r2', 0),
-                        'model_type': type(self.model).__name__,
-                    }, checkpoint_path)
-                    print(f"✓ 保存最佳模型: {checkpoint_path}")
-                    
-                    if self.experiment_tracker == 'mlflow' and MLFLOW_AVAILABLE:
-                        mlflow.log_artifact(checkpoint_path)
-                    elif self.experiment_tracker == 'wandb' and WANDB_AVAILABLE:
-                        wandb.save(checkpoint_path)
-                        
-                else:
-                    patience_counter += 1
-                    if patience_counter >= patience:
-                        print(f"早停触发，停止训练")
-                        break
                         
             except Exception as e:
                 print(f"Epoch {epoch+1} 训练出错: {e}")
                 traceback.print_exc()
                 break
         
-        print(f"\n训练完成! 最佳验证HI-R²: {best_val_hi_r2:.4f}")
+        print(f"\n训练完成! 最佳验证RUL-R²: {best_val_r2:.4f}")
         
         if self.experiment_tracker == 'mlflow' and MLFLOW_AVAILABLE:
             mlflow.end_run()
         elif self.experiment_tracker == 'wandb' and WANDB_AVAILABLE:
             wandb.finish()
         
-        return self.history, best_val_hi_r2
+        return self.history, best_val_r2
 
 
 class RULTrainer(BaseTrainer):
@@ -289,25 +356,21 @@ class RULTrainer(BaseTrainer):
         all_hi_preds = []
         all_hi_labels = []
         
+        num_batches = len(train_loader)
+        
         for batch_idx, (inputs, labels) in enumerate(train_loader):
             inputs = inputs.to(self.device)
             rul_labels, hi_labels = labels[0].to(self.device), labels[1].to(self.device)
             
             self.optimizer.zero_grad()
             
-            # 模型返回 (pred_rul, pred_hi)
             pred_rul, pred_hi = self.model(inputs)
             
-            # 计算样本权重
+            # 训练阶段：使用样本加权
             weights = self._compute_sample_weights(hi_labels)
             
-            # RUL损失
             rul_loss = self.criterion(pred_rul, rul_labels)
-            
-            # HI损失 - 使用加权MSE
             hi_loss = self.weighted_mse_loss(pred_hi, hi_labels, weights)
-            
-            # 组合损失
             loss = self.rul_loss_weight * rul_loss + self.hi_loss_weight * hi_loss
             
             loss.backward()
@@ -323,31 +386,17 @@ class RULTrainer(BaseTrainer):
             all_hi_preds.extend(pred_hi.detach().cpu().numpy().flatten())
             all_hi_labels.extend(hi_labels.detach().cpu().numpy().flatten())
             
-            if self.device.type == 'cuda' and batch_idx % 50 == 0:
+            if self.device.type == 'cuda' and (batch_idx % 200 == 199 or batch_idx == num_batches - 1):
                 torch.cuda.empty_cache()
         
         avg_loss = total_loss / len(train_loader)
         avg_rul_loss = total_rul_loss / len(train_loader)
         avg_hi_loss = total_hi_loss / len(train_loader)
         
-        # 计算RUL指标
         rul_metrics = calculate_comprehensive_metrics(
             np.array(all_rul_labels), 
             np.array(all_rul_preds),
             tolerance=self.config.get('tolerance_threshold', 0.1)
-        )
-        
-        # 计算HI指标
-        hi_metrics = calculate_comprehensive_metrics(
-            np.array(all_hi_labels), 
-            np.array(all_hi_preds),
-            tolerance=self.config.get('tolerance_threshold', 0.1)
-        )
-        
-        # 计算PHM Score
-        phm_score = calculate_phm_score(
-            np.array(all_rul_labels),
-            np.array(all_rul_preds)
         )
         
         metrics_dict = {
@@ -356,17 +405,13 @@ class RULTrainer(BaseTrainer):
             'r2': rul_metrics['r2'],
             'rmse': rul_metrics['rmse'],
             'mae': rul_metrics['mae'],
-            'mape': rul_metrics['mape'],
-            'hi_r2': hi_metrics['r2'],
-            'hi_rmse': hi_metrics['rmse'],
-            'hi_mae': hi_metrics['mae'],
-            'hi_mape': hi_metrics['mape'],
-            'phm_score': phm_score
+            'mse': rul_metrics['mse']
         }
         
         return avg_loss, metrics_dict
     
     def validate(self, val_loader):
+        """【修改】验证阶段也使用样本加权，保持与训练阶段一致"""
         self.model.eval()
         total_loss = 0
         total_rul_loss = 0
@@ -378,14 +423,18 @@ class RULTrainer(BaseTrainer):
         all_hi_labels = []
         
         with torch.no_grad():
-            for batch_idx, (inputs, labels) in enumerate(val_loader):
+            for inputs, labels in val_loader:
                 inputs = inputs.to(self.device)
                 rul_labels, hi_labels = labels[0].to(self.device), labels[1].to(self.device)
                 
                 pred_rul, pred_hi = self.model(inputs)
                 
                 rul_loss = self.criterion(pred_rul, rul_labels)
-                hi_loss = self.weighted_mse_loss(pred_hi, hi_labels)
+                
+                # 【修改】验证阶段也使用样本加权，保持与训练阶段一致
+                # 基于验证集的 HI 标签计算权重
+                weights = self._compute_sample_weights(hi_labels)
+                hi_loss = self.weighted_mse_loss(pred_hi, hi_labels, weights)
                 loss = self.rul_loss_weight * rul_loss + self.hi_loss_weight * hi_loss
                 
                 total_loss += loss.item()
@@ -407,29 +456,13 @@ class RULTrainer(BaseTrainer):
             tolerance=self.config.get('tolerance_threshold', 0.1)
         )
         
-        hi_metrics = calculate_comprehensive_metrics(
-            np.array(all_hi_labels), 
-            np.array(all_hi_preds),
-            tolerance=self.config.get('tolerance_threshold', 0.1)
-        )
-        
-        phm_score = calculate_phm_score(
-            np.array(all_rul_labels),
-            np.array(all_rul_preds)
-        )
-        
         metrics_dict = {
             'rul_loss': avg_rul_loss,
             'hi_loss': avg_hi_loss,
             'r2': rul_metrics['r2'],
             'rmse': rul_metrics['rmse'],
             'mae': rul_metrics['mae'],
-            'mape': rul_metrics['mape'],
-            'hi_r2': hi_metrics['r2'],
-            'hi_rmse': hi_metrics['rmse'],
-            'hi_mae': hi_metrics['mae'],
-            'hi_mape': hi_metrics['mape'],
-            'phm_score': phm_score
+            'mse': rul_metrics['mse']
         }
         
         return avg_loss, metrics_dict
@@ -454,6 +487,8 @@ class MultiModalTrainer(BaseTrainer):
         all_hi_preds = []
         all_hi_labels = []
         
+        num_batches = len(train_loader)
+        
         for batch_idx, batch in enumerate(train_loader):
             inputs, labels = batch
             cwt_images = inputs[0].to(self.device)
@@ -463,19 +498,13 @@ class MultiModalTrainer(BaseTrainer):
             
             self.optimizer.zero_grad()
             
-            # 模型返回 (pred_rul, pred_hi)
             pred_rul, pred_hi = self.model(cwt_images, vibration_signals)
             
-            # 计算样本权重
+            # 训练阶段：使用样本加权
             weights = self._compute_sample_weights(hi_labels)
             
-            # RUL损失
             rul_loss = self.criterion(pred_rul, rul_labels)
-            
-            # HI损失 - 使用加权MSE
             hi_loss = self.weighted_mse_loss(pred_hi, hi_labels, weights)
-            
-            # 组合损失
             loss = self.rul_loss_weight * rul_loss + self.hi_loss_weight * hi_loss
             
             loss.backward()
@@ -491,31 +520,17 @@ class MultiModalTrainer(BaseTrainer):
             all_hi_preds.extend(pred_hi.detach().cpu().numpy().flatten())
             all_hi_labels.extend(hi_labels.detach().cpu().numpy().flatten())
             
-            if self.device.type == 'cuda' and batch_idx % 50 == 0:
+            if self.device.type == 'cuda' and (batch_idx % 200 == 199 or batch_idx == num_batches - 1):
                 torch.cuda.empty_cache()
         
         avg_loss = total_loss / len(train_loader)
         avg_rul_loss = total_rul_loss / len(train_loader)
         avg_hi_loss = total_hi_loss / len(train_loader)
         
-        # 计算RUL指标
         rul_metrics = calculate_comprehensive_metrics(
             np.array(all_rul_labels), 
             np.array(all_rul_preds),
             tolerance=self.config.get('tolerance_threshold', 0.1)
-        )
-        
-        # 计算HI指标
-        hi_metrics = calculate_comprehensive_metrics(
-            np.array(all_hi_labels), 
-            np.array(all_hi_preds),
-            tolerance=self.config.get('tolerance_threshold', 0.1)
-        )
-        
-        # 计算PHM Score
-        phm_score = calculate_phm_score(
-            np.array(all_rul_labels),
-            np.array(all_rul_preds)
         )
         
         metrics_dict = {
@@ -524,17 +539,13 @@ class MultiModalTrainer(BaseTrainer):
             'r2': rul_metrics['r2'],
             'rmse': rul_metrics['rmse'],
             'mae': rul_metrics['mae'],
-            'mape': rul_metrics['mape'],
-            'hi_r2': hi_metrics['r2'],
-            'hi_rmse': hi_metrics['rmse'],
-            'hi_mae': hi_metrics['mae'],
-            'hi_mape': hi_metrics['mape'],
-            'phm_score': phm_score
+            'mse': rul_metrics['mse']
         }
         
         return avg_loss, metrics_dict
     
     def validate(self, val_loader):
+        """【修改】验证阶段也使用样本加权，保持与训练阶段一致"""
         self.model.eval()
         total_loss = 0
         total_rul_loss = 0
@@ -556,7 +567,11 @@ class MultiModalTrainer(BaseTrainer):
                 pred_rul, pred_hi = self.model(cwt_images, vibration_signals)
                 
                 rul_loss = self.criterion(pred_rul, rul_labels)
-                hi_loss = self.weighted_mse_loss(pred_hi, hi_labels)
+                
+                # 【修改】验证阶段也使用样本加权，保持与训练阶段一致
+                # 基于验证集的 HI 标签计算权重
+                weights = self._compute_sample_weights(hi_labels)
+                hi_loss = self.weighted_mse_loss(pred_hi, hi_labels, weights)
                 loss = self.rul_loss_weight * rul_loss + self.hi_loss_weight * hi_loss
                 
                 total_loss += loss.item()
@@ -578,29 +593,13 @@ class MultiModalTrainer(BaseTrainer):
             tolerance=self.config.get('tolerance_threshold', 0.1)
         )
         
-        hi_metrics = calculate_comprehensive_metrics(
-            np.array(all_hi_labels), 
-            np.array(all_hi_preds),
-            tolerance=self.config.get('tolerance_threshold', 0.1)
-        )
-        
-        phm_score = calculate_phm_score(
-            np.array(all_rul_labels),
-            np.array(all_rul_preds)
-        )
-        
         metrics_dict = {
             'rul_loss': avg_rul_loss,
             'hi_loss': avg_hi_loss,
             'r2': rul_metrics['r2'],
             'rmse': rul_metrics['rmse'],
             'mae': rul_metrics['mae'],
-            'mape': rul_metrics['mape'],
-            'hi_r2': hi_metrics['r2'],
-            'hi_rmse': hi_metrics['rmse'],
-            'hi_mae': hi_metrics['mae'],
-            'hi_mape': hi_metrics['mape'],
-            'phm_score': phm_score
+            'mse': rul_metrics['mse']
         }
         
         return avg_loss, metrics_dict

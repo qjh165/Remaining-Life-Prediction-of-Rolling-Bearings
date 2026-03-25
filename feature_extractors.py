@@ -444,7 +444,7 @@ class CWTFeatureExtractor:
             traceback.print_exc()
             
     def generate_key_timepoint_cwt_visualizations(self, full_signal, window_size, overlap_ratio, 
-                                                  output_dir, bearing_name, config):
+                                                output_dir, bearing_name, config):
         """
         生成关键时间点的CWT可视化
         
@@ -480,11 +480,22 @@ class CWTFeatureExtractor:
                 start_idx = point['start_idx']
                 end_idx = min(start_idx + window_size, len(full_signal))
                 
+                # 【新增】检查信号片段长度
+                segment_length = end_idx - start_idx
+                if segment_length < window_size:
+                    print(f"⚠️ 警告: 信号片段长度不足 ({segment_length}/{window_size})，跳过时间点 {point}")
+                    continue
+                
                 if end_idx <= start_idx:
                     print(f"警告: 无效的时间点 {start_idx}-{end_idx}")
                     continue
                 
                 segment = full_signal[start_idx:end_idx]
+                
+                # 【新增】检查信号片段有效性
+                if len(segment) == 0:
+                    print(f"警告: 空信号片段，跳过时间点 {point}")
+                    continue
                 
                 # 确定标题
                 if point['type'] == 'early':
@@ -510,7 +521,7 @@ class CWTFeatureExtractor:
                 
             except Exception as e:
                 print(f"处理时间点 {point} 时出错: {e}")
-    
+        
     def _get_visualization_points(self, config, signal_length, window_size, step_size):
         """
         获取要可视化的时间点

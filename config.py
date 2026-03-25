@@ -21,9 +21,9 @@ class BatchConfig:
         return {
             'data_root': 'E:/毕业设计/data',
             'output_root': './batch_results',
-            'pattern': r'.*Bearing.*_.*',  # 匹配轴承文件夹的正则表达式
+            'pattern': r'.*Bearing.*_.*',
             'vibration_column': 'horizontal',
-            'window_size': 1024,
+            'window_size': 4096,
             'overlap_ratio': 0.75,
             'sampling_rate': 25600,
             'batch_size': 32,
@@ -33,39 +33,54 @@ class BatchConfig:
             'hidden_sizes': [64, 32, 16],
             'dropout': 0.3,
             'test_size': 0.3,
-            'val_split': 0.5,
+            'val_split': 0.3,
             'random_seed': 42,
             'save_models': True,
             'save_scalers': True,
             'save_plots': True,
-            'skip_existing': False,  # 跳过已处理的结果
+            'skip_existing': False,
+            
+            # 【新增】跨轴承评估配置
+            'cross_bearing_eval': False,           # 是否启用跨轴承评估
+            'cross_bearing_mode': 'leave_one_out',  # 留一法: 'leave_one_out', 'train_test_split'
+            'cross_bearing_train_ratio': 0.8,       # 如果使用train_test_split模式，训练集比例
+            'cross_bearing_visualize': True,        # 是否可视化跨轴承评估结果
+            
+            # 验证平滑配置
+            'validation_smoothing': True,
+            'validation_smoothing_alpha': 0.9,
+            'validation_frequency': 2,
+            
+            # RUL归一化配置
+            'rul_normalization_mode': 'global',
+            'rul_global_max': 160,
             
             # GPU优化配置
-            'use_gpu': True,  # 是否使用GPU
-            'pin_memory': True,  # 是否使用锁页内存
-            'num_workers': 4 if os.name != 'nt' else 0,  # 数据加载工作进程数
+            'use_gpu': True,
+            'pin_memory': True,
+            'num_workers': 4 if os.name != 'nt' else 0,
             
-            # 新增配置：模型对比和鲁棒性验证
-            'compare_models': True,  # 是否进行模型对比
-            'models_to_compare': ['mlp', 'linear'],  # 要对比的模型列表
-            'robustness_test': True,  # 是否进行鲁棒性测试
-            'noise_levels': [0.0, 0.05],  # 噪声水平（相对于特征标准差）
-            'linear_model_type': 'ridge',  # 线性模型类型：linear, ridge, lasso
-            'ridge_alpha': 1.0,  # Ridge回归的alpha参数
-            'lasso_alpha': 0.1,  # Lasso回归的alpha参数
+            # 模型对比和鲁棒性验证
+            'compare_models': True,
+            'models_to_compare': ['mlp', 'multimodal'],
+            'robustness_test': True,
+            'noise_levels': [0.0, 0.05],
+            'linear_model_type': 'ridge',
+            'ridge_alpha': 1.0,
+            'lasso_alpha': 0.1,
             
-            # 新增：CWT可视化配置
-            'save_cwt_images': True,  # 是否保存CWT时频图
-            'cwt_visualization_points': 'default',  # 可视化点：'default'或具体索引列表
-            'cwt_image_dpi': 150,  # 图像DPI
-            'cwt_visualization_dir': 'cwt_visualizations',  # 可视化保存目录
+            # CWT可视化配置
+            'save_cwt_images': True,
+            'cwt_visualization_points': 'default',
+            'cwt_image_dpi': 150,
+            'cwt_visualization_dir': 'cwt_visualizations',
             
-            # 新增：增强可视化配置
-            'save_detailed_visualizations': True,  # 是否保存详细可视化图表
-            'save_per_bearing_comparisons': True,  # 是否保存单轴承对比图
-            'save_cross_bearing_summaries': True,  # 是否保存跨轴承汇总图
-            'visualization_style': 'seaborn-v0_8',  # 可视化样式
-            'visualization_dpi': 300,  # 可视化DPI
+            # 增强可视化配置
+            'save_detailed_visualizations': True,
+            'save_per_bearing_comparisons': True,
+            'save_cross_bearing_summaries': True,
+            'visualization_style': 'seaborn-v0_8',
+            'visualization_dpi': 300,
         }
     
     def _load_config_file(self, config_path: str):

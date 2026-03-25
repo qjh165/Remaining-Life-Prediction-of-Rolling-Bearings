@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, WeightedRandomSampler
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.model_selection import train_test_split
 import joblib
 import os
 from typing import Tuple, List, Optional, Dict, Any
@@ -22,7 +23,7 @@ class RULDataset(Dataset):
         """
         参数:
             features: 特征数组，形状为 [n_samples, n_features]
-            rul_labels: RUL标签数组，形状为 [n_samples]
+            rul_labels: RUL标签数组，形状为 [n_samples]（已归一化到[0,1]）
             hi_labels: HI标签数组，形状为 [n_samples]
         """
         self.features = torch.FloatTensor(features)
@@ -46,7 +47,7 @@ class MultiModalDataset(Dataset):
         参数:
             signals: 原始振动信号数组，形状为 [n_samples, signal_length]
             cwt_images: CWT图像数组，形状为 [n_samples, 1, height, width]
-            rul_labels: RUL标签数组，形状为 [n_samples]
+            rul_labels: RUL标签数组，形状为 [n_samples]（已归一化到[0,1]）
             hi_labels: HI标签数组，形状为 [n_samples]
         """
         assert len(signals) == len(cwt_images) == len(rul_labels) == len(hi_labels), \
@@ -61,7 +62,9 @@ class MultiModalDataset(Dataset):
         return len(self.rul_labels)
     
     def __getitem__(self, idx):
-        # 返回 (cwt_images, signals) 作为输入，(rul_labels, hi_labels) 作为标签
+        if idx >= len(self.rul_labels):
+            raise IndexError(f"Index {idx} out of range for dataset of size {len(self.rul_labels)}")
+        
         return (
             (torch.FloatTensor(self.cwt_images[idx]), 
              torch.FloatTensor(self.signals[idx]).unsqueeze(0)),
@@ -72,14 +75,11 @@ class MultiModalDataset(Dataset):
     def get_sample_weights(self, alpha=2.0):
         """
         根据HI值计算样本权重（退化越严重权重越大）
-        参考孙伊萍论文：对退化后期样本赋予更高权重
         
         参数:
             alpha: 权重指数，越大后期权重越高
         """
-        # 权重 = (1 - HI) ^ alpha
         weights = (1 - self.hi_labels) ** alpha
-        # 归一化
         weights = weights / np.sum(weights)
         return weights
 
@@ -87,17 +87,27 @@ class MultiModalDataset(Dataset):
 class RULDataProcessor:
     """RUL数据处理流程"""
     
-    def __init__(self, window_size=1024, overlap_ratio=0.75, sampling_rate=25600):
+    def __init__(self, window_size=1024, overlap_ratio=0.75, sampling_rate=25600, config=None):
         self.window_size = window_size
         self.overlap_ratio = overlap_ratio
         self.sampling_rate = sampling_rate
+        self.config = config or {}
         self.feature_extractor = TimeFrequencyFeatureExtractor(sampling_rate)
         self.feature_scaler = StandardScaler()
+        
+        # 【修改】RUL归一化器 - 使用MinMaxScaler但支持全局范围
         self.rul_scaler = MinMaxScaler(feature_range=(0, 1))
+        
+        # 【新增】全局RUL最大值（用于跨轴承归一化）
+        self.global_rul_max = self.config.get('rul_global_max', 160)
+        self.normalization_mode = self.config.get('rul_normalization_mode', 'global')
         
         # 特征维度
         self.feature_dim = self.feature_extractor.get_feature_dimension()
         print(f"特征提取器维度: {self.feature_dim}")
+        print(f"RUL归一化模式: {self.normalization_mode}")
+        if self.normalization_mode == 'global':
+            print(f"全局RUL最大值: {self.global_rul_max}")
     
     def create_dataset(self, full_signal, rul_array, hi_array):
         """从信号、RUL标签和HI标签创建数据集"""
@@ -142,7 +152,6 @@ class RULDataProcessor:
                     
             except Exception as e:
                 print(f"处理窗口 {window_count} 时出错: {e}")
-                # 使用默认特征
                 default_features = self.feature_extractor._get_default_features()
                 features_list.append(default_features)
                 rul_labels.append(rul_value)
@@ -169,24 +178,75 @@ class RULDataProcessor:
         return X_processed
     
     def preprocess_labels(self, y, fit=True):
-        """预处理标签（仅用于RUL，HI不需要归一化）"""
+        """
+        预处理RUL标签 - 归一化到 [0, 1]
+        
+        参数:
+            y: 原始RUL值数组
+            fit: 是否拟合（决定使用当前轴承的max还是全局max）
+        
+        返回:
+            归一化后的RUL标签
+        """
         if len(y) == 0:
             return np.array([])
         
         y = y.reshape(-1, 1)
+        
         if fit:
-            y_processed = self.rul_scaler.fit_transform(y)
+            if self.normalization_mode == 'global':
+                # 使用全局最大值归一化（跨轴承统一）
+                # 注意：训练时仍然需要记录当前轴承的最大值用于反归一化
+                y_processed = y / self.global_rul_max
+                # 保存当前轴承的实际最大值，用于反归一化
+                self.current_bearing_max = float(np.max(y))
+                print(f"  RUL归一化: 使用全局最大值 {self.global_rul_max}, "
+                      f"当前轴承实际最大值 {self.current_bearing_max:.1f}")
+            else:
+                # 使用当前轴承的最大值归一化（per_bearing模式，向后兼容）
+                y_processed = self.rul_scaler.fit_transform(y)
+                self.current_bearing_max = float(np.max(y))
+                print(f"  RUL归一化: 使用当前轴承最大值 {self.current_bearing_max:.1f}")
         else:
-            y_processed = self.rul_scaler.transform(y)
+            # 测试/验证阶段：使用之前保存的最大值进行归一化
+            if hasattr(self, 'current_bearing_max'):
+                y_processed = y / self.current_bearing_max
+            else:
+                # 降级处理
+                y_processed = self.rul_scaler.transform(y) if hasattr(self.rul_scaler, 'scale_') else y
+        
+        # 确保归一化值在 [0, 1] 范围内
+        y_processed = np.clip(y_processed, 0, 1)
+        
         return y_processed.flatten()
     
-    def inverse_transform_labels(self, y_normalized):
-        """反归一化标签"""
-        if len(y_normalized) == 0:
+    def inverse_transform_labels(self, labels_normalized):
+        """
+        反归一化RUL标签
+        
+        参数:
+            labels_normalized: 归一化后的RUL值（范围[0,1]）
+        
+        返回:
+            原始尺度的RUL值
+        """
+        if len(labels_normalized) == 0:
             return np.array([])
         
-        y_normalized = y_normalized.reshape(-1, 1)
-        y_original = self.rul_scaler.inverse_transform(y_normalized)
+        labels_normalized = labels_normalized.reshape(-1, 1)
+        
+        # 【修改】优先使用全局归一化模式的最大值
+        # 这样在跨轴承评估时，训练集和测试集使用相同的反归一化基准
+        if self.normalization_mode == 'global':
+            # 使用全局最大值反归一化
+            y_original = labels_normalized * self.global_rul_max
+        elif hasattr(self, 'current_bearing_max') and self.current_bearing_max is not None:
+            # 使用当前轴承最大值反归一化（per_bearing模式）
+            y_original = labels_normalized * self.current_bearing_max
+        else:
+            # 使用scaler反归一化（向后兼容）
+            y_original = self.rul_scaler.inverse_transform(labels_normalized)
+        
         return y_original.flatten()
     
     def save_scalers(self, path='scalers'):
@@ -194,16 +254,22 @@ class RULDataProcessor:
         os.makedirs(path, exist_ok=True)
         joblib.dump(self.feature_scaler, os.path.join(path, 'feature_scaler.joblib'))
         joblib.dump(self.rul_scaler, os.path.join(path, 'rul_scaler.joblib'))
+        # 【新增】保存当前轴承最大值
+        if hasattr(self, 'current_bearing_max'):
+            np.save(os.path.join(path, 'current_bearing_max.npy'), self.current_bearing_max)
     
     def load_scalers(self, path='scalers'):
         """加载标准化器"""
         self.feature_scaler = joblib.load(os.path.join(path, 'feature_scaler.joblib'))
         self.rul_scaler = joblib.load(os.path.join(path, 'rul_scaler.joblib'))
+        # 【新增】加载当前轴承最大值
+        max_path = os.path.join(path, 'current_bearing_max.npy')
+        if os.path.exists(max_path):
+            self.current_bearing_max = np.load(max_path)
     
     def get_feature_dimension(self):
         """获取特征维度"""
         return self.feature_dim
-
 
 class MultiModalDataProcessor:
     """多模态数据处理流程"""
@@ -212,7 +278,7 @@ class MultiModalDataProcessor:
                  window_size=1024, 
                  overlap_ratio=0.75,
                  sampling_rate=25600,
-                 cwt_image_shape=(1, 64, 64),  # 包含通道维度
+                 cwt_image_shape=(1, 64, 64),
                  config=None):
         """
         初始化多模态数据处理器
@@ -233,9 +299,16 @@ class MultiModalDataProcessor:
         # 创建CWT特征提取器
         self.cwt_extractor = CWTFeatureExtractor(sampling_rate=sampling_rate)
         
-        # 归一化器（仅用于RUL）
+        # 【修改】RUL归一化器 - 使用MinMaxScaler但支持全局范围
         self.rul_scaler = MinMaxScaler(feature_range=(0, 1))
-        # HI不需要归一化，因为已经是在[0,1]范围内
+        
+        # 【新增】全局RUL最大值
+        self.global_rul_max = self.config.get('rul_global_max', 160)
+        self.normalization_mode = self.config.get('rul_normalization_mode', 'global')
+        
+        print(f"RUL归一化模式: {self.normalization_mode}")
+        if self.normalization_mode == 'global':
+            print(f"全局RUL最大值: {self.global_rul_max}")
     
     def process_signal_chunk(self, full_signal, rul_array, hi_array, chunk_size=1000000):
         """流式处理信号，避免内存溢出"""
@@ -324,6 +397,11 @@ class MultiModalDataProcessor:
         print(f"多模态特征提取完成，共提取 {total_samples} 个样本")
         print(f"HI标签范围: [{min(hi_labels_list):.3f}, {max(hi_labels_list):.3f}]")
         
+        # 保存当前轴承的RUL最大值用于后续反归一化
+        if rul_labels_list:
+            self.current_bearing_max = float(np.max(rul_labels_list))
+            print(f"当前轴承RUL最大值: {self.current_bearing_max:.1f}")
+        
         # 如果启用了CWT可视化，生成关键时间点的时频图
         if (self.config.get('save_cwt_images', True) and 
             bearing_output_dir is not None and 
@@ -340,16 +418,66 @@ class MultiModalDataProcessor:
         return signals_list, cwt_images_list, rul_labels_list, hi_labels_list
     
     def preprocess_labels(self, labels, fit=True):
-        """预处理标签（仅用于RUL，HI不需要归一化）"""
+        """
+        预处理RUL标签 - 归一化到 [0, 1]
+        
+        参数:
+            labels: 原始RUL值列表或数组
+            fit: 是否拟合（决定使用当前轴承的max还是全局max）
+        
+        返回:
+            归一化后的RUL标签
+        """
         labels = np.array(labels).reshape(-1, 1)
+        
         if fit:
-            labels_scaled = self.rul_scaler.fit_transform(labels)
+            if self.normalization_mode == 'global':
+                # 使用全局最大值归一化
+                labels_scaled = labels / self.global_rul_max
+                self.current_bearing_max = float(np.max(labels))
+                print(f"  RUL归一化: 使用全局最大值 {self.global_rul_max}, "
+                    f"当前轴承实际最大值 {self.current_bearing_max:.1f}")
+            else:
+                # 使用当前轴承的最大值归一化
+                labels_scaled = self.rul_scaler.fit_transform(labels)
+                self.current_bearing_max = float(np.max(labels))
+                print(f"  RUL归一化: 使用当前轴承最大值 {self.current_bearing_max:.1f}")
         else:
-            labels_scaled = self.rul_scaler.transform(labels)
+            # 【关键修复】测试/验证阶段：使用之前保存的最大值进行归一化
+            if hasattr(self, 'current_bearing_max') and self.current_bearing_max is not None:
+                labels_scaled = labels / self.current_bearing_max
+            elif self.normalization_mode == 'global':
+                labels_scaled = labels / self.global_rul_max
+            else:
+                labels_scaled = self.rul_scaler.transform(labels) if hasattr(self.rul_scaler, 'scale_') else labels
+        
+        # 确保归一化值在 [0, 1] 范围内
+        labels_scaled = np.clip(labels_scaled, 0, 1)
+        
         return labels_scaled.flatten()
     
     def inverse_transform_labels(self, labels_normalized):
-        """反归一化标签"""
+        """
+        反归一化RUL标签
+        
+        参数:
+            labels_normalized: 归一化后的RUL值（范围[0,1]）
+        
+        返回:
+            原始尺度的RUL值
+        """
         labels_normalized = np.array(labels_normalized).reshape(-1, 1)
-        labels_original = self.rul_scaler.inverse_transform(labels_normalized)
+        
+        # 【修改】优先使用全局归一化模式的最大值
+        # 这样在跨轴承评估时，训练集和测试集使用相同的反归一化基准
+        if self.normalization_mode == 'global':
+            # 使用全局最大值反归一化
+            labels_original = labels_normalized * self.global_rul_max
+        elif hasattr(self, 'current_bearing_max') and self.current_bearing_max is not None:
+            # 使用当前轴承最大值反归一化（per_bearing模式）
+            labels_original = labels_normalized * self.current_bearing_max
+        else:
+            # 使用scaler反归一化（向后兼容）
+            labels_original = self.rul_scaler.inverse_transform(labels_normalized)
+        
         return labels_original.flatten()

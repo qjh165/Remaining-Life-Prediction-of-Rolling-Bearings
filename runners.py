@@ -47,7 +47,7 @@ from trainers import (
 )
 from evaluators import RULEvaluator, ModelComparisonVisualizer, VisualizationTool
 from feature_extractors import CWTFeatureExtractor
-from evaluation import calculate_comprehensive_metrics, print_metrics_summary, calculate_phm_score
+from evaluation import calculate_comprehensive_metrics, print_metrics_summary
 
 
 class ModelRunner:
@@ -190,39 +190,31 @@ class ModelRunner:
         
         return history, best_val_score
     
+    # 在 ModelRunner 类的 evaluate_model 方法中
     def evaluate_model(self, model, test_loader, data_processor, device):
-        """评估模型 - 使用全面评估指标，包含HI评估"""
+        """评估模型 - 使用XJTU-SY标准指标"""
         model.eval()
         all_rul_preds = []
         all_rul_labels = []
-        all_hi_preds = []
-        all_hi_labels = []
         
         model = model.to(device)
         
         with torch.no_grad():
             for batch in test_loader:
-                # 1. 解包批次数据 - 新格式: (inputs, (rul_labels, hi_labels))
                 if isinstance(batch, (list, tuple)) and len(batch) == 2:
                     inputs, labels = batch
                 else:
                     self.logger.warning(f"批次数据格式异常: {type(batch)}")
                     continue
                 
-                # 2. 根据模型类型处理输入数据
                 if isinstance(model, MultiModalRULPredictor):
-                    # 多模态模型处理
                     if isinstance(inputs, (list, tuple)) and len(inputs) == 2:
                         cwt_images = inputs[0].to(device, non_blocking=True)
                         vibration_signals = inputs[1].to(device, non_blocking=True)
+                        pred_rul, _ = model(cwt_images, vibration_signals)
                         
-                        # 模型返回 (pred_rul, pred_hi)
-                        pred_rul, pred_hi = model(cwt_images, vibration_signals)
-                        
-                        # 处理标签 - 现在是元组 (rul_labels, hi_labels)
                         if isinstance(labels, (list, tuple)) and len(labels) == 2:
                             rul_labels = labels[0].cpu().numpy().flatten()
-                            hi_labels = labels[1].cpu().numpy().flatten()
                         else:
                             self.logger.error(f"错误: 标签格式不正确: {type(labels)}")
                             continue
@@ -230,113 +222,96 @@ class ModelRunner:
                         self.logger.error(f"错误: 多模态模型输入格式不正确")
                         continue
                 else:
-                    # 单模态模型处理
                     if isinstance(inputs, (list, tuple)):
                         inputs = inputs[0].to(device, non_blocking=True)
                     else:
                         inputs = inputs.to(device, non_blocking=True)
                     
-                    # 单模态模型返回 (pred_rul, pred_hi)
-                    pred_rul, pred_hi = model(inputs)
+                    pred_rul, _ = model(inputs)
                     
-                    # 处理标签
                     if isinstance(labels, (list, tuple)) and len(labels) == 2:
                         rul_labels = labels[0].cpu().numpy().flatten()
-                        hi_labels = labels[1].cpu().numpy().flatten()
                     else:
                         self.logger.error(f"错误: 标签格式不正确: {type(labels)}")
                         continue
                 
-                # 收集预测结果和标签
                 all_rul_preds.extend(pred_rul.cpu().numpy().flatten())
                 all_rul_labels.extend(rul_labels)
-                all_hi_preds.extend(pred_hi.cpu().numpy().flatten())
-                all_hi_labels.extend(hi_labels)
         
-        # 转换为numpy数组
         all_rul_preds = np.array(all_rul_preds)
         all_rul_labels = np.array(all_rul_labels)
-        all_hi_preds = np.array(all_hi_preds)
-        all_hi_labels = np.array(all_hi_labels)
         
-        # 检查数组是否为空
         if all_rul_preds.size == 0 or all_rul_labels.size == 0:
             self.logger.error("Prediction or label array is empty after evaluation.")
-            return {}, [], [], [], []
+            return {}, [], []
         
-        # 反归一化RUL（HI不需要反归一化，已经在[0,1]范围）
+        # 【修改】反归一化RUL - 使用 data_processor 的方法
         all_rul_preds_original = all_rul_preds.copy()
         all_rul_labels_original = all_rul_labels.copy()
         
         if data_processor is not None:
             try:
+                # 反归一化预测值和真实值
                 all_rul_preds_original = data_processor.inverse_transform_labels(all_rul_preds)
                 all_rul_labels_original = data_processor.inverse_transform_labels(all_rul_labels)
                 
                 self.logger.info(f"反归一化后统计 (RUL):")
-                self.logger.info(f"  - 预测值范围: [{all_rul_preds_original.min():.2f}, {all_rul_preds_original.max():.2f}]")
                 self.logger.info(f"  - 真实值范围: [{all_rul_labels_original.min():.2f}, {all_rul_labels_original.max():.2f}]")
+                self.logger.info(f"  - 预测值范围: [{all_rul_preds_original.min():.2f}, {all_rul_preds_original.max():.2f}]")
+                self.logger.info(f"  - 归一化预测值范围: [{all_rul_preds.min():.4f}, {all_rul_preds.max():.4f}]")
+                self.logger.info(f"  - 归一化真实值范围: [{all_rul_labels.min():.4f}, {all_rul_labels.max():.4f}]")
                 
+                if np.any(all_rul_preds_original < 0):
+                    negative_preds = np.sum(all_rul_preds_original < 0)
+                    self.logger.warning(f"⚠️ 发现 {negative_preds} 个负的RUL预测值，将裁剪为0")
+                    all_rul_preds_original = np.maximum(all_rul_preds_original, 0)
+                    
             except Exception as e:
                 self.logger.error(f"反归一化标签时出错: {e}")
                 self.logger.warning("将在归一化尺度上计算指标")
                 all_rul_preds_original = all_rul_preds
                 all_rul_labels_original = all_rul_labels
         
-        # 计算RUL指标
-        rul_metrics = calculate_comprehensive_metrics(
+        # 计算XJTU-SY标准指标（在原始尺度上计算）
+        eval_metrics = calculate_comprehensive_metrics(
             all_rul_labels_original, 
             all_rul_preds_original,
             tolerance=self.config.get('tolerance_threshold', 0.1)
         )
         
-        # 计算HI指标（HI已经是[0,1]范围，不需要反归一化）
-        hi_metrics = calculate_comprehensive_metrics(
-            all_hi_labels, 
-            all_hi_preds,
+        # 【新增】同时计算归一化尺度上的指标（用于监控训练过程）
+        norm_metrics = calculate_comprehensive_metrics(
+            all_rul_labels, 
+            all_rul_preds,
             tolerance=self.config.get('tolerance_threshold', 0.1)
         )
         
-        # 计算PHM Score
-        phm_score = calculate_phm_score(all_rul_labels_original, all_rul_preds_original)
-        
-        # 合并指标
-        eval_metrics = {
-            **rul_metrics,
-            **{f"hi_{k}": v for k, v in hi_metrics.items()},
-            'phm_score': phm_score
-        }
-        
         # 记录评估结果
         self.logger.info("=" * 60)
-        self.logger.info("评估指标汇总:")
+        self.logger.info("XJTU-SY标准评估结果 (原始尺度):")
         self.logger.info("-" * 40)
-        self.logger.info("RUL指标:")
-        self.logger.info(f"  - R²: {eval_metrics['r2']:.4f}")
-        self.logger.info(f"  - RMSE: {eval_metrics['rmse']:.4f}")
-        self.logger.info(f"  - MAE: {eval_metrics['mae']:.4f}")
-        self.logger.info(f"  - MAPE: {eval_metrics['mape']:.2f}%")
-        self.logger.info(f"  - 容错准确率: {eval_metrics['accuracy_within_tolerance']:.2f}%")
+        self.logger.info(f"  R²: {eval_metrics['r2']:.4f}")
+        self.logger.info(f"  MSE: {eval_metrics['mse']:.6f}")
+        self.logger.info(f"  RMSE: {eval_metrics['rmse']:.4f}")
+        self.logger.info(f"  MAE: {eval_metrics['mae']:.4f}")
         self.logger.info("-" * 40)
-        self.logger.info("HI指标:")
-        self.logger.info(f"  - HI-R²: {eval_metrics.get('hi_r2', 0):.4f}")
-        self.logger.info(f"  - HI-RMSE: {eval_metrics.get('hi_rmse', 0):.4f}")
-        self.logger.info(f"  - HI-MAE: {eval_metrics.get('hi_mae', 0):.4f}")
-        self.logger.info(f"  - HI-MAPE: {eval_metrics.get('hi_mape', 0):.2f}%")
-        self.logger.info(f"  - HI容错准确率: {eval_metrics.get('hi_accuracy_within_tolerance', 0):.2f}%")
-        self.logger.info("-" * 40)
-        self.logger.info(f"PHM Score: {eval_metrics.get('phm_score', 0):.4f}")
+        self.logger.info("归一化尺度指标 (监控用):")
+        self.logger.info(f"  R²: {norm_metrics['r2']:.4f}")
+        self.logger.info(f"  MSE: {norm_metrics['mse']:.6f}")
+        self.logger.info(f"  RMSE: {norm_metrics['rmse']:.4f}")
+        self.logger.info(f"  MAE: {norm_metrics['mae']:.4f}")
         self.logger.info("=" * 60)
         
-        # 打印前10个样本的详细结果（便于检查）
-        self.logger.info("\n前10个样本的详细结果:")
-        self.logger.info("样本 | 真实RUL | 预测RUL | 真实HI | 预测HI")
-        self.logger.info("-" * 50)
+        # 打印前10个样本的详细结果（原始尺度）
+        self.logger.info("\n前10个样本的详细结果 (原始尺度):")
+        self.logger.info("样本 | 真实RUL | 预测RUL | 绝对误差 | 归一化真实 | 归一化预测")
+        self.logger.info("-" * 75)
         for i in range(min(10, len(all_rul_labels_original))):
+            abs_error = abs(all_rul_preds_original[i] - all_rul_labels_original[i])
             self.logger.info(f"{i:4d} | {all_rul_labels_original[i]:7.2f} | {all_rul_preds_original[i]:7.2f} | "
-                            f"{all_hi_labels[i]:6.3f} | {all_hi_preds[i]:6.3f}")
+                            f"{abs_error:7.2f} | {all_rul_labels[i]:6.4f} | {all_rul_preds[i]:6.4f}")
         
-        return eval_metrics, all_rul_preds_original, all_rul_labels_original, all_hi_preds, all_hi_labels
+        return eval_metrics, all_rul_preds_original, all_rul_labels_original
     
     def _calculate_metrics(self, preds, labels):
         """计算评估指标（向后兼容）"""
@@ -351,21 +326,6 @@ class ModelRunner:
         except Exception as e:
             print(f"计算R²时出错: {e}")
             eval_metrics['r2'] = 0.0
-        
-        mask = labels != 0
-        if np.any(mask):
-            try:
-                mape_values = np.abs(preds[mask] - labels[mask]) / np.abs(labels[mask])
-                eval_metrics['mape'] = np.mean(mape_values) * 100
-            except Exception as e:
-                print(f"计算MAPE时出错: {e}")
-                eval_metrics['mape'] = 0.0
-        else:
-            eval_metrics['mape'] = 0.0
-        
-        errors = preds - labels
-        eval_metrics['error_mean'] = np.mean(errors)
-        eval_metrics['error_std'] = np.std(errors)
         
         return eval_metrics
 
@@ -786,7 +746,7 @@ class EnhancedBatchRULProcessor:
         input_dim = X_train.shape[1]
         model = ModelFactory.create_model('mlp', self.config, input_dim=input_dim)
         
-        # 创建数据加载器 - 注意现在传入rul和hi标签
+        # 创建数据加载器
         batch_size = min(self.config['batch_size'], len(X_train))
         
         # 创建数据集
@@ -853,8 +813,8 @@ class EnhancedBatchRULProcessor:
             test_dataset = RULDataset(X_test_current, y_rul_test, y_hi_test)
             test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
             
-            # 评估模型
-            metrics_dict, rul_preds, rul_labels, hi_preds, hi_labels = self.model_runner.evaluate_model(
+            # 【修复】评估模型 - 现在只返回3个值
+            metrics_dict, rul_preds, rul_labels = self.model_runner.evaluate_model(
                 model, test_loader, processor, self.model_runner.device
             )
             
@@ -862,9 +822,7 @@ class EnhancedBatchRULProcessor:
             if test_desc == "clean":
                 predictions_dict['clean'] = {
                     'rul_predictions': rul_preds,
-                    'rul_true_values': rul_labels,
-                    'hi_predictions': hi_preds,
-                    'hi_true_values': hi_labels
+                    'rul_true_values': rul_labels
                 }
             
             mlp_results[test_desc] = metrics_dict
@@ -879,7 +837,7 @@ class EnhancedBatchRULProcessor:
             }
         }
         
-        self.logger.info(f"MLP训练完成，最佳验证HI-R²: {best_val_score:.4f}")
+        self.logger.info(f"MLP训练完成，最佳验证RUL-R²: {best_val_score:.4f}")
         return result, predictions_dict
     
     def _train_linear_model(self, X_train, y_rul_train, y_hi_train,
@@ -1023,7 +981,7 @@ class EnhancedBatchRULProcessor:
                 return {}, {}
     
     def _create_per_bearing_visualizations(self, model_predictions, processor, y_rul_test_scaled, y_hi_test,
-                                          bearing_name, bearing_output_dir):
+                                        bearing_name, bearing_output_dir):
         """创建单轴承可视化，包括RUL和HI曲线"""
         try:
             # 创建可视化目录
@@ -1035,14 +993,11 @@ class EnhancedBatchRULProcessor:
             
             # 准备各模型预测结果
             models_rul_pred_dict = {}
-            models_hi_pred_dict = {}
             
             for model_name, pred_dict in model_predictions.items():
                 if 'clean' in pred_dict:
                     if 'rul_predictions' in pred_dict['clean']:
                         models_rul_pred_dict[model_name] = pred_dict['clean']['rul_predictions']
-                    if 'hi_predictions' in pred_dict['clean']:
-                        models_hi_pred_dict[model_name] = pred_dict['clean']['hi_predictions']
             
             # 创建RUL趋势对比图
             if models_rul_pred_dict:
@@ -1055,18 +1010,18 @@ class EnhancedBatchRULProcessor:
                 if rul_trend_path:
                     self.logger.info(f"RUL趋势对比图已保存: {rul_trend_path}")
             
-            # 创建HI曲线图（使用第一个模型的HI预测）
-            if models_hi_pred_dict and self.config.get('enable_hi_visualization', True):
-                first_model = list(models_hi_pred_dict.keys())[0]
+            # 【修改】HI曲线图 - 使用配置决定是否生成
+            if self.config.get('enable_hi_visualization', True):
+                # 由于不再有HI预测，可以选择生成真实HI曲线
                 hi_curve_path = self.rul_evaluator.create_health_indicator_curves(
                     true_his=y_hi_test,
-                    pred_his=models_hi_pred_dict[first_model],
+                    pred_his=y_hi_test,  # 使用真实值作为参考
                     bearing_name=bearing_name,
                     output_dir=str(viz_dir),
-                    title_suffix=f"({first_model}模型)"
+                    title_suffix="(真实HI)"
                 )
                 if hi_curve_path:
-                    self.logger.info(f"HI曲线图已保存: {hi_curve_path}")
+                    self.logger.info(f"真实HI曲线图已保存: {hi_curve_path}")
             
             # 为每个模型创建残差分析图
             for model_name, pred_dict in model_predictions.items():
@@ -1084,9 +1039,9 @@ class EnhancedBatchRULProcessor:
         except Exception as e:
             self.logger.error(f"创建单轴承可视化失败: {e}")
             traceback.print_exc()
-    
+ 
     def _extract_summary_info(self, bearing_folder, models_results, test_samples=0):
-        """从模型结果中提取汇总信息"""
+        """从模型结果中提取汇总信息（只保留4个核心指标）"""
         summary = {
             'bearing': bearing_folder,
             'test_samples': test_samples,
@@ -1095,9 +1050,10 @@ class EnhancedBatchRULProcessor:
         for model_name, model_info in models_results.items():
             for test_desc, metrics_dict in model_info['results'].items():
                 prefix = f"{model_name}_{test_desc}_"
-                for metric_name, metric_value in metrics_dict.items():
-                    if metric_name in ['r2', 'rmse', 'mae', 'mape', 'hi_r2', 'phm_score']:
-                        summary[f"{prefix}{metric_name}"] = metric_value
+                # 只保留4个核心指标
+                for metric_name in ['r2', 'mse', 'rmse', 'mae']:
+                    if metric_name in metrics_dict:
+                        summary[f"{prefix}{metric_name}"] = metrics_dict[metric_name]
         
         # 添加模型特定信息
         if 'mlp' in models_results:
@@ -1201,7 +1157,7 @@ class EnhancedBatchRULProcessor:
         self.logger.info("="*80)
         
         # 打印关键指标
-        key_metrics = [col for col in df_summary.columns if any(x in col for x in ['r2_clean', 'hi_r2', 'phm_score'])]
+        key_metrics = [col for col in df_summary.columns if any(x in col for x in ['r2_clean', 'hi_r2'])]
         for metric in key_metrics:
             if metric in df_summary.columns:
                 self.logger.info(f"{metric}: 平均={df_summary[metric].mean():.4f}, 标准差={df_summary[metric].std():.4f}")
@@ -1465,9 +1421,9 @@ class EnhancedMultiModalBatchProcessor(EnhancedBatchRULProcessor):
             return None
     
     def _train_multimodal_model(self, X_train_sig, X_train_cwt, y_rul_train, y_hi_train,
-                               X_val_sig, X_val_cwt, y_rul_val, y_hi_val,
-                               X_test_sig, X_test_cwt, y_rul_test, y_hi_test,
-                               processor, bearing_output_dir, bearing_name):
+                            X_val_sig, X_val_cwt, y_rul_val, y_hi_val,
+                            X_test_sig, X_test_cwt, y_rul_test, y_hi_test,
+                            processor, bearing_output_dir, bearing_name):
         """训练多模态模型"""
         self.logger.info(f"训练多模态模型...")
         
@@ -1535,8 +1491,8 @@ class EnhancedMultiModalBatchProcessor(EnhancedBatchRULProcessor):
             history_file = bearing_output_dir / f"multimodal_training_history_{bearing_name}.pkl"
             joblib.dump(history, history_file)
             
-            # 评估模型
-            metrics_dict, rul_preds, rul_labels, hi_preds, hi_labels = self.model_runner.evaluate_model(
+            # 【修复】评估模型 - 现在只返回3个值
+            metrics_dict, rul_preds, rul_labels = self.model_runner.evaluate_model(
                 model, test_loader, processor, self.model_runner.device
             )
             
@@ -1553,16 +1509,15 @@ class EnhancedMultiModalBatchProcessor(EnhancedBatchRULProcessor):
                 }
             }
             
+            # 【修复】预测结果只包含RUL相关数据
             predictions = {
                 'clean': {
                     'rul_predictions': rul_preds,
-                    'rul_true_values': rul_labels,
-                    'hi_predictions': hi_preds,
-                    'hi_true_values': hi_labels
+                    'rul_true_values': rul_labels
                 }
             }
             
-            self.logger.info(f"多模态模型训练完成，最佳验证HI-R²: {best_val_score:.4f}")
+            self.logger.info(f"多模态模型训练完成，最佳验证RUL-R²: {best_val_score:.4f}")
             self.logger.info(f"模型参数量: {model.get_parameter_count():,}")
             
             # 使用全面评估指标打印结果
@@ -1589,6 +1544,8 @@ class EnhancedMultiModalBatchProcessor(EnhancedBatchRULProcessor):
     def generate_single_bearing_model_comparison(self, bearing_name, results_base_dir=None):
         """
         生成单个轴承的模型性能对比图
+        
+        【修改】增强版：支持更多搜索模式，自动识别不同模型的结果
         """
         if results_base_dir is None:
             results_base_dir = self.config['output_root']
@@ -1602,56 +1559,61 @@ class EnhancedMultiModalBatchProcessor(EnhancedBatchRULProcessor):
             # 1. 明确查找所有相关文件夹
             model_folders_info = []
             
-            # 首先查找纯轴承名文件夹 (通常是MLP模型)
-            mlp_folder = results_base_dir / bearing_name
-            if mlp_folder.exists() and mlp_folder.is_dir():
-                self.logger.info(f"找到MLP模型文件夹: {mlp_folder}")
-                model_folders_info.append(("mlp", str(mlp_folder)))
+            # 【修改】定义更多搜索模式
+            search_patterns = [
+                # 标准命名
+                (bearing_name, "mlp"),
+                (f"multimodal_{bearing_name}", "multimodal"),
+                (f"mlp_{bearing_name}", "mlp"),
+                (f"linear_{bearing_name}", "linear"),
+                (f"ridge_{bearing_name}", "ridge"),
+                (f"lasso_{bearing_name}", "lasso"),
+                
+                # 处理35Hz12kN_Bearing1_1格式
+                (f"multimodal_{bearing_name}", "multimodal"),
+                (f"{bearing_name}", "mlp"),
+                
+                # 处理带有下划线的变体
+                (bearing_name.replace('_', ''), "mlp_variant"),
+                (f"multimodal_{bearing_name.replace('_', '')}", "multimodal_variant"),
+            ]
             
-            # 查找multimodal_前缀文件夹
-            multimodal_folder = results_base_dir / f"multimodal_{bearing_name}"
-            if multimodal_folder.exists() and multimodal_folder.is_dir():
-                self.logger.info(f"找到多模态模型文件夹: {multimodal_folder}")
-                model_folders_info.append(("multimodal", str(multimodal_folder)))
+            # 首先尝试精确匹配
+            for folder_name, model_type in search_patterns:
+                folder_path = results_base_dir / folder_name
+                if folder_path.exists() and folder_path.is_dir():
+                    self.logger.info(f"找到 {model_type} 模型文件夹: {folder_path}")
+                    model_folders_info.append((model_type, str(folder_path)))
             
-            # 查找其他可能的模型文件夹
-            search_pattern = os.path.join(results_base_dir, f"*{bearing_name}*")
-            all_folders = glob.glob(search_pattern)
-            
-            for folder_path in all_folders:
-                if os.path.isdir(folder_path):
-                    folder_name = os.path.basename(folder_path)
-                    
-                    # 跳过已经添加的文件夹
-                    if folder_name == bearing_name or folder_name == f"multimodal_{bearing_name}":
-                        continue
-                    
-                    # 推断模型类型
-                    if "linear" in folder_name.lower() or "ridge" in folder_name.lower() or "lasso" in folder_name.lower():
-                        model_type = "linear"
-                    elif "cnn" in folder_name.lower():
-                        model_type = "cnn"
-                    elif "lstm" in folder_name.lower():
-                        model_type = "lstm"
-                    elif "ensemble" in folder_name.lower():
-                        model_type = "ensemble"
-                    elif "svm" in folder_name.lower():
-                        model_type = "svm"
-                    elif "rf" in folder_name.lower() or "randomforest" in folder_name.lower():
-                        model_type = "randomforest"
-                    else:
-                        # 尝试从文件名提取
-                        if bearing_name in folder_name:
-                            parts = folder_name.split(bearing_name)
-                            if parts[0]:
-                                model_type = parts[0].rstrip('_').rstrip('-')
-                            else:
-                                model_type = "unknown"
+            # 【新增】如果精确匹配不够，进行模糊搜索
+            if len(model_folders_info) < 2:
+                self.logger.info("精确匹配不足2个模型，开始模糊搜索...")
+                
+                # 搜索所有包含轴承名的文件夹
+                all_folders = list(results_base_dir.glob(f"*{bearing_name}*"))
+                
+                for folder_path in all_folders:
+                    if folder_path.is_dir() and str(folder_path) not in [info[1] for info in model_folders_info]:
+                        folder_name = folder_path.name
+                        
+                        # 推断模型类型
+                        if "multimodal" in folder_name.lower():
+                            model_type = "multimodal"
+                        elif "linear" in folder_name.lower() or "ridge" in folder_name.lower() or "lasso" in folder_name.lower():
+                            model_type = "linear"
+                        elif "mlp" in folder_name.lower():
+                            model_type = "mlp"
+                        elif "cnn" in folder_name.lower():
+                            model_type = "cnn"
+                        elif "lstm" in folder_name.lower():
+                            model_type = "lstm"
+                        elif "transformer" in folder_name.lower():
+                            model_type = "transformer"
                         else:
                             model_type = "unknown"
-                    
-                    self.logger.info(f"找到其他模型文件夹 ({model_type}): {folder_name}")
-                    model_folders_info.append((model_type, folder_path))
+                        
+                        self.logger.info(f"找到其他模型文件夹 ({model_type}): {folder_name}")
+                        model_folders_info.append((model_type, str(folder_path)))
             
             if not model_folders_info:
                 self.logger.error(f"未找到任何包含轴承名称 {bearing_name} 的文件夹")
@@ -1668,7 +1630,7 @@ class EnhancedMultiModalBatchProcessor(EnhancedBatchRULProcessor):
                     
                     metrics = self._load_metrics_smart(folder_path, bearing_name, model_type)
                     
-                    if metrics:
+                    if metrics and metrics.get('r2', 0) > 0:  # 【新增】只接受有效的R²
                         # 确保名称唯一
                         unique_name = model_type
                         counter = 1
@@ -1677,9 +1639,10 @@ class EnhancedMultiModalBatchProcessor(EnhancedBatchRULProcessor):
                             counter += 1
                         
                         models_results[unique_name] = metrics
-                        self.logger.info(f"成功加载 {unique_name}: R²={metrics.get('r2', 0):.4f}, HI-R²={metrics.get('hi_r2', 0):.4f}, RMSE={metrics.get('rmse', 0):.3f}")
+                        self.logger.info(f"成功加载 {unique_name}: R²={metrics.get('r2', 0):.4f}, "
+                                    f"HI-R²={metrics.get('hi_r2', 0):.4f}, RMSE={metrics.get('rmse', 0):.3f}")
                     else:
-                        self.logger.warning(f"无法从 {folder_path} 加载指标")
+                        self.logger.warning(f"无法从 {folder_path} 加载有效指标")
                         
                 except Exception as e:
                     self.logger.error(f"处理文件夹 {folder_path} 时出错: {e}")
@@ -1714,7 +1677,8 @@ class EnhancedMultiModalBatchProcessor(EnhancedBatchRULProcessor):
                     "models_results": models_results,
                     "generated_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "chart_path": str(chart_path),
-                    "total_models": len(models_results)
+                    "total_models": len(models_results),
+                    "search_patterns_used": [p[0] for p in search_patterns[:5]]  # 【新增】记录搜索模式
                 }
                 
                 data_file = comparison_output_dir / f"model_comparison_data_{bearing_name}.json"
@@ -1816,7 +1780,7 @@ class EnhancedMultiModalBatchProcessor(EnhancedBatchRULProcessor):
             metrics['mae'] = data.get('mae', data.get('MAE', 0))
             metrics['mape'] = data.get('mape', data.get('MAPE', 0))
             metrics['hi_r2'] = data.get('hi_r2', 0)
-            metrics['phm_score'] = data.get('phm_score', 0)
+            
             return metrics
         
         # 方法2: 查找models_results
@@ -1847,7 +1811,7 @@ class EnhancedMultiModalBatchProcessor(EnhancedBatchRULProcessor):
             metrics['mae'] = eval_metrics.get('mae', 0)
             metrics['mape'] = eval_metrics.get('mape', 0)
             metrics['hi_r2'] = eval_metrics.get('hi_r2', 0)
-            metrics['phm_score'] = eval_metrics.get('phm_score', 0)
+            
             return metrics
         
         # 方法4: 在嵌套结构中查找
@@ -1861,7 +1825,7 @@ class EnhancedMultiModalBatchProcessor(EnhancedBatchRULProcessor):
                     metrics['mae'] = obj.get('mae', obj.get('MAE', 0))
                     metrics['mape'] = obj.get('mape', obj.get('MAPE', 0))
                     metrics['hi_r2'] = obj.get('hi_r2', 0)
-                    metrics['phm_score'] = obj.get('phm_score', 0)
+                    
                     return True
                 
                 # 递归搜索
@@ -1892,7 +1856,7 @@ class EnhancedMultiModalBatchProcessor(EnhancedBatchRULProcessor):
                 metrics['mae'] = clean_results.get('mae', 0)
                 metrics['mape'] = clean_results.get('mape', 0)
                 metrics['hi_r2'] = clean_results.get('hi_r2', 0)
-                metrics['phm_score'] = clean_results.get('phm_score', 0)
+                
             # 直接包含指标
             elif 'r2' in model_data or 'R2' in model_data:
                 metrics['r2'] = model_data.get('r2', model_data.get('R2', 0))
@@ -1900,7 +1864,7 @@ class EnhancedMultiModalBatchProcessor(EnhancedBatchRULProcessor):
                 metrics['mae'] = model_data.get('mae', model_data.get('MAE', 0))
                 metrics['mape'] = model_data.get('mape', model_data.get('MAPE', 0))
                 metrics['hi_r2'] = model_data.get('hi_r2', 0)
-                metrics['phm_score'] = model_data.get('phm_score', 0)
+                
         
         return metrics
     
@@ -2007,36 +1971,36 @@ class EnhancedMultiModalBatchProcessor(EnhancedBatchRULProcessor):
                             ha='center', va='bottom', fontsize=10,
                             fontweight='bold')
             
-            # 4. PHM Score对比图
+            # 4. MAE对比图（替代原来的PHM Score）
             ax4 = axes[1, 1]
-            phm_values = [models_results[m].get('phm_score', 0) for m in model_names]
-            bars4 = ax4.bar(range(len(model_names)), phm_values, color=colors, edgecolor='black', linewidth=1.5)
-            
+            mae_values = [models_results[m].get('mae', 0) for m in model_names]
+            bars4 = ax4.bar(range(len(model_names)), mae_values, color=colors, edgecolor='black', linewidth=1.5)
+
             ax4.set_xlabel('模型', fontproperties=fm.FontProperties(family=selected_font, size=11))
-            ax4.set_ylabel('PHM Score', fontproperties=fm.FontProperties(family=selected_font, size=11))
-            ax4.set_title('PHM Score对比\n(越小越好)', 
+            ax4.set_ylabel('MAE', fontproperties=fm.FontProperties(family=selected_font, size=11))
+            ax4.set_title('MAE对比\n(越小越好)', 
                         fontproperties=fm.FontProperties(family=selected_font, size=12, weight='bold'))
-            
+
             ax4.set_xticks(range(len(model_names)))
             ax4.set_xticklabels([m.upper() for m in model_names], 
                             rotation=45, ha='right', 
                             fontproperties=fm.FontProperties(family=selected_font, size=10))
             ax4.grid(True, alpha=0.3, linestyle='--')
-            
-            if phm_values:
-                phm_max = max(phm_values)
-                ax4.set_ylim(0, phm_max * 1.15)
-            
-            for bar, value in zip(bars4, phm_values):
+
+            if mae_values:
+                mae_max = max(mae_values)
+                ax4.set_ylim(0, mae_max * 1.15)
+
+            for bar, value in zip(bars4, mae_values):
                 height = bar.get_height()
-                ax4.annotate(f'{value:.2f}',
+                ax4.annotate(f'{value:.3f}',
                             xy=(bar.get_x() + bar.get_width() / 2, height),
                             xytext=(0, 3),
                             textcoords="offset points",
                             ha='center', va='bottom', fontsize=10,
                             fontweight='bold')
-            
-            ax4.text(0.02, 0.98, 'PHM Score:\n越小越好',
+
+            ax4.text(0.02, 0.98, 'MAE:\n越小越好',
                     transform=ax4.transAxes, fontsize=9,
                     verticalalignment='top',
                     fontproperties=fm.FontProperties(family=selected_font, size=9),
@@ -2073,32 +2037,53 @@ class EnhancedMultiModalBatchProcessor(EnhancedBatchRULProcessor):
 # ==================== 配置文件模板生成函数 ====================
 def create_enhanced_multimodal_config_template():
     """创建增强版多模态配置文件模板"""
-    template = """# 增强版多模态批量RUL预测处理器配置文件
-# 版本: 7.0 - 支持健康因子(HI)联合训练和PHM Score
+    template = """
+# 增强版多模态批量RUL预测处理器配置文件
+# 版本: 7.0 - 支持健康因子(HI)联合训练
+# 评估指标: R², MSE, RMSE, MAE
 
 # 数据路径配置
 data_root: "E:/毕业设计/data"
-output_root: "./multimodal_batch_results"
+output_root: "./batch_results"
 
 # 文件匹配模式
 pattern: ".*Bearing.*_.*"
 
 # 工况选择
-use_only_35khz: true  # 是否只使用35kHz工况的数据
+use_only_35khz: true
 
 # 数据处理配置
 vibration_column: "horizontal"
-window_size: 1024
+window_size: 4096
 overlap_ratio: 0.75
 sampling_rate: 25600
+
+# ==================== RUL归一化配置 ====================
+rul_normalization_mode: "global"
+rul_global_max: 160
+
+# ==================== 跨轴承评估配置 ====================
+cross_bearing_eval: false              # 是否启用跨轴承评估
+cross_bearing_mode: "leave_one_out"    # 评估模式: "leave_one_out" 或 "train_test_split"
+cross_bearing_train_ratio: 0.8         # train_test_split模式下的训练集比例
+cross_bearing_visualize: true          # 是否可视化跨轴承评估结果
+
+# CWT图像配置
+cwt_image_shape: [1, 128, 128]
 
 # 训练配置
 batch_size: 32
 epochs: 100
 patience: 15
+min_delta: 0.001
 learning_rate: 0.001
 dropout: 0.3
 weight_decay: 0.0001
+
+# 验证平滑配置
+validation_smoothing: true
+validation_smoothing_alpha: 0.9
+validation_frequency: 2
 
 # GPU优化配置
 use_gpu: true
@@ -2107,17 +2092,17 @@ num_workers: 4
 
 # 数据划分配置
 test_size: 0.3
-val_split: 0.5
+val_split: 0.3
 random_seed: 42
 
-# ==================== 健康因子(HI)配置 ====================
-rul_loss_weight: 1.0      # RUL损失权重
-hi_loss_weight: 1.0       # HI损失权重（增大以加强HI学习）
-use_sample_weighting: true  # 是否使用样本加权（退化后期权重更大）
-weighting_alpha: 2.0      # 权重指数，越大后期权重越高
-enable_hi_visualization: true  # 是否生成HI曲线图
+# 健康因子(HI)配置
+rul_loss_weight: 1.0
+hi_loss_weight: 1.0
+use_sample_weighting: true
+weighting_alpha: 2.0
+enable_hi_visualization: true
 
-# ==================== 模型架构配置 ====================
+# 模型架构配置
 cnn_architecture: "simple"
 pretrained_model_name: "resnet18"
 signal_processor: "lstm"
@@ -2128,13 +2113,10 @@ transformer_config:
   dim_feedforward: 256
 prediction_head_dims: [128, 64, 32]
 
-# ==================== 损失函数配置 ====================
+# 损失函数配置
 loss_function: "mse"
-mixed_loss_weights:
-  mse: 1.0
-  r2: 0.1
 
-# ==================== 学习率调度器配置 ====================
+# 学习率调度器配置
 lr_scheduler: "plateau"
 lr_scheduler_params:
   mode: "min"
@@ -2142,23 +2124,18 @@ lr_scheduler_params:
   patience: 5
   min_lr: 1e-6
 
-# ==================== 实验跟踪配置 ====================
-enable_experiment_tracking: false
-experiment_tracker: "mlflow"
-experiment_name: "bearing_rul_prediction"
-
-# ==================== 评估指标配置 ====================
+# 评估指标配置
 tolerance_threshold: 0.1
 
-# ==================== 模型对比配置 ====================
+# 模型对比配置
 compare_models: true
 models_to_compare: ["mlp", "multimodal"]
 
-# ==================== 鲁棒性验证配置 ====================
+# 鲁棒性验证配置
 robustness_test: false
 noise_levels: [0.0, 0.05]
 
-# ==================== 可视化配置 ====================
+# 可视化配置
 save_cwt_images: true
 cwt_visualization_points: "default"
 cwt_image_dpi: 150
@@ -2222,6 +2199,568 @@ skip_existing: false
     print(f"基础版配置文件模板已创建: {template_path}")
     return template_path
 
+
+
+# ==================== 跨轴承评估器 ====================
+
+class CrossBearingEvaluator:
+    """
+    跨轴承评估器 - 支持留一法和训练/测试划分
+    用于验证模型的泛化能力，避免数据泄漏
+    """
+    
+    def __init__(self, config: BatchConfig, logger: logging.Logger = None):
+        self.config = config
+        self.logger = logger or logging.getLogger("CrossBearingEvaluator")
+        
+        # 获取配置
+        self.cross_bearing_mode = config.get('cross_bearing_mode', 'leave_one_out')
+        self.cross_bearing_train_ratio = config.get('cross_bearing_train_ratio', 0.8)
+        self.cross_bearing_visualize = config.get('cross_bearing_visualize', True)
+        
+        # 创建输出目录
+        self.output_root = Path(config['output_root']) / "cross_bearing_evaluation"
+        self.output_root.mkdir(parents=True, exist_ok=True)
+        
+        # 初始化模型运行器
+        self.model_runner = ModelRunner(config)
+        
+        # 初始化可视化工具
+        self.rul_evaluator = RULEvaluator(config)
+        
+        self.logger.info(f"跨轴承评估器初始化: 模式={self.cross_bearing_mode}")
+    
+    def group_bearings_by_condition(self, bearing_folders: List[str]) -> Dict[str, List[Dict]]:
+        """
+        按工况分组轴承
+        
+        参数:
+            bearing_folders: 轴承文件夹路径列表
+        
+        返回:
+            工况分组字典，格式: {condition: [{'name': folder, 'bearing_num': num}]}
+        """
+        conditions = {}
+        
+        for folder in bearing_folders:
+            # 提取文件夹名（处理相对路径）
+            folder_name = folder.replace(os.sep, '_').replace('/', '_')
+            
+            # 解析工况和轴承编号
+            # XJTU-SY格式: "35Hz12kN_Bearing1_1" 或 "35Hz12kN/Bearing1_1"
+            parts = folder_name.split('_')
+            
+            if len(parts) >= 2:
+                # 工况通常是前2-3部分，如 "35Hz12kN"
+                condition = '_'.join(parts[:-1])
+                bearing_num = parts[-1] if len(parts) > 1 else folder_name
+            else:
+                condition = 'unknown'
+                bearing_num = folder_name
+            
+            if condition not in conditions:
+                conditions[condition] = []
+            
+            conditions[condition].append({
+                'name': folder,
+                'bearing_num': bearing_num,
+                'folder_name': folder_name
+            })
+        
+        # 按轴承编号排序
+        for condition in conditions:
+            conditions[condition].sort(key=lambda x: x['bearing_num'])
+        
+        return conditions
+    
+    def merge_bearings_data(self, bearing_list: List[Dict], fit_scaler: bool = True) -> Tuple:
+        """
+        合并多个轴承的数据
+        
+        参数:
+            bearing_list: 轴承信息列表
+            fit_scaler: 是否拟合归一化器（训练集为True，测试集为False）
+        
+        返回:
+            (signals_list, cwt_images_list, rul_labels_list, hi_labels_list, processor)
+        """
+        all_signals = []
+        all_rul_labels = []
+        all_hi_labels = []
+        
+        # 创建数据处理器
+        processor = MultiModalDataProcessor(
+            window_size=self.config['window_size'],
+            overlap_ratio=self.config['overlap_ratio'],
+            sampling_rate=self.config['sampling_rate'],
+            cwt_image_shape=(1, 128, 128),
+            config=self.config
+        )
+        
+        data_loader = XJTUDataLoader(vibration_column=self.config['vibration_column'])
+        
+        # 记录所有轴承的原始RUL最大值
+        bearing_max_rul = []
+        
+        for bearing_info in bearing_list:
+            bearing_path = os.path.join(self.config['data_root'], bearing_info['name'])
+            
+            self.logger.info(f"  加载轴承: {bearing_info['name']}")
+            
+            signal, rul, hi = data_loader.load_bearing_data(bearing_path)
+            
+            if signal is None or rul is None or hi is None:
+                self.logger.warning(f"  警告: 轴承 {bearing_info['name']} 数据加载失败，跳过")
+                continue
+            
+            all_signals.append(signal)
+            all_rul_labels.append(rul)
+            all_hi_labels.append(hi)
+            bearing_max_rul.append(np.max(rul))
+        
+        if not all_signals:
+            self.logger.error("没有成功加载任何轴承数据")
+            return None, None, None, None, None
+        
+        # 合并信号
+        combined_signal = np.concatenate(all_signals)
+        combined_rul = np.concatenate(all_rul_labels)
+        combined_hi = np.concatenate(all_hi_labels)
+        
+        # 记录合并后的RUL最大值（用于归一化）
+        combined_max_rul = np.max(combined_rul)
+        
+        self.logger.info(f"  合并后信号长度: {len(combined_signal):,}")
+        self.logger.info(f"  合并后RUL范围: [{combined_rul.min():.1f}, {combined_rul.max():.1f}]")
+        self.logger.info(f"  各轴承RUL最大值: {bearing_max_rul}")
+        
+        # 特征提取
+        signals_list, cwt_images_list, rul_labels_list, hi_labels_list = processor.create_dataset(
+            full_signal=combined_signal,
+            rul_array=combined_rul,
+            hi_array=combined_hi,
+            bearing_output_dir=None,
+            bearing_name="merged"
+        )
+        
+        if fit_scaler:
+            # 训练集：拟合RUL归一化器
+            # 保存训练集的实际最大值
+            processor.current_bearing_max = combined_max_rul
+            rul_labels_scaled = processor.preprocess_labels(rul_labels_list, fit=True)
+            self.logger.info(f"  训练集RUL归一化: 使用最大值 {combined_max_rul:.1f}")
+        else:
+            # 测试集：使用训练集拟合的归一化器
+            rul_labels_scaled = processor.preprocess_labels(rul_labels_list, fit=False)
+        
+        return signals_list, cwt_images_list, rul_labels_scaled, hi_labels_list, processor
+    
+    def train_model_on_bearings(self, train_bearings: List[Dict], 
+                                test_bearing: Dict) -> Tuple[Dict, Dict]:
+        """
+        在训练轴承上训练模型，在测试轴承上评估
+        
+        参数:
+            train_bearings: 训练轴承列表
+            test_bearing: 测试轴承信息
+        
+        返回:
+            (metrics_dict, predictions_dict)
+        """
+        self.logger.info(f"  训练轴承数: {len(train_bearings)}")
+        self.logger.info(f"  测试轴承: {test_bearing['name']}")
+        
+        # 加载并合并训练数据
+        train_signals, train_cwt, train_rul, train_hi, processor = self.merge_bearings_data(
+            train_bearings, fit_scaler=True
+        )
+        
+        if train_signals is None:
+            return None, None
+        
+        # 加载测试数据
+        test_processor = MultiModalDataProcessor(
+            window_size=self.config['window_size'],
+            overlap_ratio=self.config['overlap_ratio'],
+            sampling_rate=self.config['sampling_rate'],
+            cwt_image_shape=(1, 128, 128),
+            config=self.config
+        )
+        
+        # 【关键修复】测试集必须使用与训练集相同的归一化参数
+        # 复制训练集拟合的归一化参数
+        test_processor.global_rul_max = processor.global_rul_max
+        test_processor.normalization_mode = processor.normalization_mode
+        
+        # 【关键修复】测试集使用训练集的最大值进行归一化，而不是自身最大值
+        test_processor.current_bearing_max = processor.current_bearing_max
+        
+        data_loader = XJTUDataLoader(vibration_column=self.config['vibration_column'])
+        test_bearing_path = os.path.join(self.config['data_root'], test_bearing['name'])
+        test_signal, test_rul, test_hi = data_loader.load_bearing_data(test_bearing_path)
+        
+        if test_signal is None:
+            self.logger.error(f"测试轴承数据加载失败: {test_bearing['name']}")
+            return None, None
+        
+        # 特征提取
+        test_signals, test_cwt, test_rul_raw, test_hi = test_processor.create_dataset(
+            full_signal=test_signal,
+            rul_array=test_rul,
+            hi_array=test_hi,
+            bearing_output_dir=None,
+            bearing_name=test_bearing['name']
+        )
+        
+        # 【关键修复】测试集RUL归一化 - 使用训练集的最大值（fit=False）
+        test_rul_scaled = test_processor.preprocess_labels(test_rul_raw, fit=False)
+        
+        # 保存测试集的实际最大值（仅用于日志和可视化）
+        test_max_rul = float(np.max(test_rul_raw)) if len(test_rul_raw) > 0 else 1.0
+        
+        self.logger.info(f"  训练集RUL最大值: {processor.current_bearing_max:.1f}")
+        self.logger.info(f"  测试集RUL最大值: {test_max_rul:.1f}")
+        self.logger.info(f"  归一化: 测试集使用训练集最大值 {processor.current_bearing_max:.1f}")
+        
+        # 划分训练集和验证集
+        total_samples = len(train_signals)
+        val_samples = int(total_samples * self.config['val_split'])
+        train_samples = total_samples - val_samples
+        
+        indices = np.random.permutation(total_samples)
+        train_indices = indices[:train_samples]
+        val_indices = indices[train_samples:]
+        
+        X_train_sig = np.array([train_signals[i] for i in train_indices])
+        X_train_cwt = np.array([train_cwt[i] for i in train_indices])
+        y_rul_train = np.array([train_rul[i] for i in train_indices])
+        y_hi_train = np.array([train_hi[i] for i in train_indices])
+        
+        X_val_sig = np.array([train_signals[i] for i in val_indices])
+        X_val_cwt = np.array([train_cwt[i] for i in val_indices])
+        y_rul_val = np.array([train_rul[i] for i in val_indices])
+        y_hi_val = np.array([train_hi[i] for i in val_indices])
+        
+        X_test_sig = np.array(test_signals)
+        X_test_cwt = np.array(test_cwt)
+        y_rul_test = np.array(test_rul_scaled)
+        y_hi_test = np.array(test_hi)
+        
+        self.logger.info(f"  训练集大小: {len(X_train_sig)}, 验证集大小: {len(X_val_sig)}, 测试集大小: {len(X_test_sig)}")
+        
+        # 创建多模态模型
+        input_signal_length = len(X_train_sig[0]) if len(X_train_sig) > 0 else 1024
+        cwt_image_shape = (1, 128, 128)
+        
+        model = MultiModalRULPredictor(
+            cwt_image_shape=cwt_image_shape,
+            signal_length=input_signal_length,
+            cnn_channels=[16, 32, 64],
+            lstm_hidden_size=64,
+            lstm_num_layers=2,
+            fusion_method='late',
+            dropout_rate=self.config['dropout']
+        )
+        
+        # 创建数据集
+        train_dataset = MultiModalDataset(X_train_sig, X_train_cwt, y_rul_train, y_hi_train)
+        val_dataset = MultiModalDataset(X_val_sig, X_val_cwt, y_rul_val, y_hi_val)
+        test_dataset = MultiModalDataset(X_test_sig, X_test_cwt, y_rul_test, y_hi_test)
+        
+        # 创建数据加载器
+        batch_size = min(self.config['batch_size'], len(X_train_sig))
+        pin_memory = self.config.get('pin_memory', True) and torch.cuda.is_available()
+        num_workers = self.config.get('num_workers', 0)
+        
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                                num_workers=num_workers, pin_memory=pin_memory)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                                num_workers=num_workers, pin_memory=pin_memory)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+                                num_workers=num_workers, pin_memory=pin_memory)
+        
+        # 训练模型
+        model_save_path = self.output_root / f"model_{test_bearing['name'].replace(os.sep, '_')}.pth"
+        optimizer = optim.Adam(model.parameters(), lr=self.config['learning_rate'])
+        criterion = nn.MSELoss()
+        
+        trainer = MultiModalTrainer(
+            model=model,
+            optimizer=optimizer,
+            criterion=criterion,
+            scheduler=None,
+            device=DEVICE,
+            config=self.config
+        )
+        
+        history, best_val_score = trainer.train(
+            train_loader=train_loader,
+            val_loader=val_loader,
+            num_epochs=self.config['epochs'],
+            patience=self.config['patience'],
+            checkpoint_path=str(model_save_path)
+        )
+        
+        # 加载最佳模型
+        if model_save_path.exists():
+            checkpoint = torch.load(model_save_path, map_location=DEVICE)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            model.move_to_device(DEVICE)
+        
+        # 【关键修复】评估模型时，传入 test_processor（它使用训练集的最大值进行反归一化）
+        eval_metrics, rul_preds, rul_labels = self.model_runner.evaluate_model(
+            model, test_loader, test_processor, DEVICE
+        )
+        
+        # 打印评估结果
+        self.logger.info(f"  测试集 R²: {eval_metrics.get('r2', 0):.4f}")
+        self.logger.info(f"  测试集 RMSE: {eval_metrics.get('rmse', 0):.4f}")
+        self.logger.info(f"  测试集 MAE: {eval_metrics.get('mae', 0):.4f}")
+        
+        return eval_metrics, {
+            'predictions': rul_preds,
+            'true_values': rul_labels,
+            'history': history,
+            'best_val_score': best_val_score,
+            'train_max_rul': processor.current_bearing_max,
+            'test_max_rul': test_max_rul
+        }
+    
+    def evaluate_cross_bearing(self, bearing_folders: List[str]) -> List[Dict]:
+        """
+        执行跨轴承评估
+        
+        参数:
+            bearing_folders: 轴承文件夹路径列表
+        
+        返回:
+            评估结果列表
+        """
+        self.logger.info("=" * 80)
+        self.logger.info("开始跨轴承评估")
+        self.logger.info(f"模式: {self.cross_bearing_mode}")
+        self.logger.info("=" * 80)
+        
+        # 按工况分组
+        conditions = self.group_bearings_by_condition(bearing_folders)
+        
+        self.logger.info(f"找到 {len(conditions)} 个工况:")
+        for condition, bearings in conditions.items():
+            bearing_names = [b['name'] for b in bearings]
+            self.logger.info(f"  {condition}: {len(bearings)}个轴承 - {bearing_names}")
+        
+        all_results = []
+        
+        for condition, bearings in conditions.items():
+            self.logger.info(f"\n{'='*60}")
+            self.logger.info(f"工况: {condition}")
+            self.logger.info(f"轴承列表: {[b['name'] for b in bearings]}")
+            self.logger.info(f"{'='*60}")
+            
+            if self.cross_bearing_mode == 'leave_one_out':
+                # 留一法：每个轴承作为测试集
+                for test_idx, test_bearing in enumerate(bearings):
+                    train_bearings = [b for i, b in enumerate(bearings) if i != test_idx]
+                    
+                    self.logger.info(f"\n测试轴承: {test_bearing['name']}")
+                    self.logger.info(f"训练轴承: {[b['name'] for b in train_bearings]}")
+                    
+                    # 训练和评估
+                    metrics, predictions = self.train_model_on_bearings(train_bearings, test_bearing)
+                    
+                    if metrics:
+                        result = {
+                            'condition': condition,
+                            'test_bearing': test_bearing['name'],
+                            'train_bearings': [b['name'] for b in train_bearings],
+                            'metrics': metrics,
+                            'predictions': predictions
+                        }
+                        all_results.append(result)
+                        self.logger.info(f"  测试集 R²: {metrics.get('r2', 0):.4f}")
+                    else:
+                        self.logger.warning(f"  评估失败，跳过")
+            
+            elif self.cross_bearing_mode == 'train_test_split':
+                # 训练/测试划分模式
+                n_bearings = len(bearings)
+                n_train = int(n_bearings * self.cross_bearing_train_ratio)
+                
+                # 随机划分
+                indices = np.random.permutation(n_bearings)
+                train_indices = indices[:n_train]
+                test_indices = indices[n_train:]
+                
+                train_bearings = [bearings[i] for i in train_indices]
+                test_bearings = [bearings[i] for i in test_indices]
+                
+                self.logger.info(f"训练轴承: {[b['name'] for b in train_bearings]}")
+                self.logger.info(f"测试轴承: {[b['name'] for b in test_bearings]}")
+                
+                # 对每个测试轴承进行评估
+                for test_bearing in test_bearings:
+                    metrics, predictions = self.train_model_on_bearings(train_bearings, test_bearing)
+                    
+                    if metrics:
+                        result = {
+                            'condition': condition,
+                            'test_bearing': test_bearing['name'],
+                            'train_bearings': [b['name'] for b in train_bearings],
+                            'metrics': metrics,
+                            'predictions': predictions
+                        }
+                        all_results.append(result)
+                        self.logger.info(f"  测试轴承 {test_bearing['name']} R²: {metrics.get('r2', 0):.4f}")
+        
+        # 汇总结果
+        self._summarize_cross_bearing_results(all_results)
+        
+        # 可视化
+        if self.cross_bearing_visualize:
+            self._visualize_cross_bearing_results(all_results)
+        
+        return all_results
+    
+    def _summarize_cross_bearing_results(self, results: List[Dict]):
+        """汇总跨轴承评估结果"""
+        if not results:
+            self.logger.warning("没有评估结果可汇总")
+            return
+        
+        self.logger.info("\n" + "=" * 80)
+        self.logger.info("跨轴承评估汇总结果")
+        self.logger.info("=" * 80)
+        
+        # 创建DataFrame
+        summary_data = []
+        for result in results:
+            summary_data.append({
+                'condition': result['condition'],
+                'test_bearing': result['test_bearing'],
+                'train_bearings_count': len(result['train_bearings']),
+                'train_bearings': ', '.join(result['train_bearings']),
+                'r2': result['metrics'].get('r2', 0),
+                'rmse': result['metrics'].get('rmse', 0),
+                'mae': result['metrics'].get('mae', 0),
+                'mse': result['metrics'].get('mse', 0)
+            })
+        
+        df_summary = pd.DataFrame(summary_data)
+        
+        # 保存汇总文件
+        summary_csv_path = self.output_root / "cross_bearing_summary.csv"
+        df_summary.to_csv(summary_csv_path, index=False, encoding='utf-8-sig')
+        
+        summary_excel_path = self.output_root / "cross_bearing_summary.xlsx"
+        df_summary.to_excel(summary_excel_path, index=False)
+        
+        self.logger.info(f"汇总文件已保存:")
+        self.logger.info(f"  CSV: {summary_csv_path}")
+        self.logger.info(f"  Excel: {summary_excel_path}")
+        
+        # 打印统计
+        self.logger.info(f"\n统计结果:")
+        self.logger.info(f"  评估次数: {len(results)}")
+        self.logger.info(f"  平均 R²: {df_summary['r2'].mean():.4f} ± {df_summary['r2'].std():.4f}")
+        self.logger.info(f"  平均 RMSE: {df_summary['rmse'].mean():.4f} ± {df_summary['rmse'].std():.4f}")
+        self.logger.info(f"  平均 MAE: {df_summary['mae'].mean():.4f} ± {df_summary['mae'].std():.4f}")
+        
+        # 按工况分组统计
+        self.logger.info(f"\n按工况分组统计:")
+        for condition in df_summary['condition'].unique():
+            cond_df = df_summary[df_summary['condition'] == condition]
+            self.logger.info(f"  {condition}: R²={cond_df['r2'].mean():.4f} ± {cond_df['r2'].std():.4f} (n={len(cond_df)})")
+        
+        # 打印详细结果
+        self.logger.info(f"\n详细结果:")
+        for idx, row in df_summary.iterrows():
+            self.logger.info(f"  {idx+1}. {row['test_bearing']}: R²={row['r2']:.4f}, RMSE={row['rmse']:.4f}, MAE={row['mae']:.4f}")
+    
+    def _visualize_cross_bearing_results(self, results: List[Dict]):
+        """可视化跨轴承评估结果"""
+        try:
+            viz_dir = self.output_root / "visualizations"
+            viz_dir.mkdir(parents=True, exist_ok=True)
+            
+            if not results:
+                return
+            
+            # 提取指标
+            conditions = []
+            r2_values = []
+            rmse_values = []
+            mae_values = []
+            bearing_names = []
+            
+            for result in results:
+                conditions.append(result['condition'])
+                bearing_names.append(result['test_bearing'])
+                r2_values.append(result['metrics'].get('r2', 0))
+                rmse_values.append(result['metrics'].get('rmse', 0))
+                mae_values.append(result['metrics'].get('mae', 0))
+            
+            # 创建柱状图
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            
+            # R²柱状图
+            ax1 = axes[0]
+            colors = plt.cm.Set3(range(len(r2_values)))
+            bars1 = ax1.bar(range(len(r2_values)), r2_values, color=colors, edgecolor='black')
+            ax1.set_xlabel('测试轴承', fontproperties=fm.FontProperties(family=selected_font, size=11))
+            ax1.set_ylabel('R²', fontproperties=fm.FontProperties(family=selected_font, size=11))
+            ax1.set_title('跨轴承评估 - R²分数', fontproperties=fm.FontProperties(family=selected_font, size=12, weight='bold'))
+            ax1.set_xticks(range(len(r2_values)))
+            ax1.set_xticklabels(bearing_names, rotation=45, ha='right', fontsize=8)
+            ax1.axhline(y=np.mean(r2_values), color='r', linestyle='--', label=f'平均={np.mean(r2_values):.3f}')
+            ax1.legend(prop=fm.FontProperties(family=selected_font, size=9))
+            ax1.set_ylim(0, 1.05)
+            
+            for bar, val in zip(bars1, r2_values):
+                ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                        f'{val:.3f}', ha='center', va='bottom', fontsize=8)
+            
+            # RMSE柱状图
+            ax2 = axes[1]
+            bars2 = ax2.bar(range(len(rmse_values)), rmse_values, color=colors, edgecolor='black')
+            ax2.set_xlabel('测试轴承', fontproperties=fm.FontProperties(family=selected_font, size=11))
+            ax2.set_ylabel('RMSE', fontproperties=fm.FontProperties(family=selected_font, size=11))
+            ax2.set_title('跨轴承评估 - RMSE', fontproperties=fm.FontProperties(family=selected_font, size=12, weight='bold'))
+            ax2.set_xticks(range(len(rmse_values)))
+            ax2.set_xticklabels(bearing_names, rotation=45, ha='right', fontsize=8)
+            ax2.axhline(y=np.mean(rmse_values), color='r', linestyle='--', label=f'平均={np.mean(rmse_values):.2f}')
+            ax2.legend(prop=fm.FontProperties(family=selected_font, size=9))
+            
+            for bar, val in zip(bars2, rmse_values):
+                ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                        f'{val:.2f}', ha='center', va='bottom', fontsize=8)
+            
+            # MAE柱状图
+            ax3 = axes[2]
+            bars3 = ax3.bar(range(len(mae_values)), mae_values, color=colors, edgecolor='black')
+            ax3.set_xlabel('测试轴承', fontproperties=fm.FontProperties(family=selected_font, size=11))
+            ax3.set_ylabel('MAE', fontproperties=fm.FontProperties(family=selected_font, size=11))
+            ax3.set_title('跨轴承评估 - MAE', fontproperties=fm.FontProperties(family=selected_font, size=12, weight='bold'))
+            ax3.set_xticks(range(len(mae_values)))
+            ax3.set_xticklabels(bearing_names, rotation=45, ha='right', fontsize=8)
+            ax3.axhline(y=np.mean(mae_values), color='r', linestyle='--', label=f'平均={np.mean(mae_values):.2f}')
+            ax3.legend(prop=fm.FontProperties(family=selected_font, size=9))
+            
+            for bar, val in zip(bars3, mae_values):
+                ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                        f'{val:.2f}', ha='center', va='bottom', fontsize=8)
+            
+            plt.suptitle('跨轴承评估结果汇总', fontproperties=fm.FontProperties(family=selected_font, size=14, weight='bold'))
+            plt.tight_layout()
+            
+            save_path = viz_dir / "cross_bearing_results.png"
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.close(fig)
+            
+            self.logger.info(f"跨轴承评估可视化已保存: {save_path}")
+            
+        except Exception as e:
+            self.logger.error(f"可视化跨轴承结果失败: {e}")
+            traceback.print_exc()
 
 def create_quick_test_config():
     """创建快速测试配置文件"""
